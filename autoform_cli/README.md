@@ -83,6 +83,7 @@ An article asserts only facts a human or agent verified:
 | `not_ready: true` | Needs more blueprint work before it can be attempted. |
 | `lean: Ns.decl` | Declaration name(s) that discharge the article. |
 | `discussion: 42` | Issue number or URL where the article is being discussed. |
+| `skeleton_approved: 3f9a2c1d5e7b8a90` | A person approved the statement's skeleton with this hash. |
 
 Everything a reader thinks of as progress is *derived* from the DAG on every
 run, so it cannot go stale:
@@ -271,6 +272,135 @@ each one as a `declared-coverage-gap`. That is intended: a roadmap is published
 while it is still being decomposed, and the published `coverage.complete: false`
 is how a reader sees that. Run `autoform audit` in CI when you want mapped rows
 to block a merge.
+
+Extract what a reader must trust for each formalized statement:
+
+```bash
+autoform skeleton blueprint --lean-root .
+autoform skeleton blueprint --lean-root . --node chapter/main-result
+autoform skeleton blueprint --lean-root . --output skeleton.json --packets review-packets --passages review-passages
+autoform skeleton blueprint --lean-root . --output skeleton.json --probe
+```
+
+A theorem means what its statement means. The skeleton of a `lean:`
+declaration is the reading list a person needs to agree that the Lean says what
+the article claims: the elaborated signature, then every project declaration
+the *statement* rests on, transitively, quoted from the sources in dependency
+order. A definition contributes its body as well as its type, because the body
+is part of its meaning; a theorem met along the way contributes only its type.
+Proofs are never entered. The proof beneath a skeleton may be orders of
+magnitude longer, and it is the kernel's to check, not the reader's. Each
+skeleton also reports the axioms the declaration finally rests on, so a `sorry`
+shows up as `sorryAx` beside the statement rather than under it, and the
+non-core constants it assumes from Mathlib or another dependency, listed by
+name so a reader can see that a statement uses the library's notion of a limit
+rather than a homemade one.
+
+The closure is computed from elaborated terms, which is why this is the one
+command that runs Lean: it writes a small probe and runs it with
+`lake env lean` against the built project. A lexical closure would miss what
+`open`, notation, implicit instances, and auto-bound variables bring in, and
+every miss silently shrinks the surface a reader is told to trust. Constructors,
+projections, recursors, matchers, and equation lemmas are folded onto the
+declaration the reader sees in the source, so a structure appears once, as its
+`structure` block. Names outside the project are the trusted base and are not
+expanded. The command exits nonzero when a `lean:` name is absent from the
+sources or from the built environment, and it writes nothing into the vault;
+`--output` records the `autoform-skeleton/v1` report, which contains no
+timestamp or absolute path, for a later render or review to consume. The
+report quotes each trusted declaration's source, so it stands on its own.
+
+Every skeleton carries a sixteen-hex **hash** of its meaning: the elaborated
+signature and the comment-stripped text of every trusted declaration. A
+clearer docstring leaves it unchanged; any edit to a signature or a
+definition's body changes it. An article with several `lean:` names has one
+hash over all of them, printed as the article skeleton. Two kinds of testimony
+are pinned to that hash:
+
+- **Approval.** When a person has compared the book statement with the
+  skeleton and agreed that the Lean says what the book says, the article
+  records `skeleton_approved: <article hash>`. It is an assertion, so it lives
+  in frontmatter like every other checked fact.
+- **Read-backs.** `--packets DIR` writes one comment-stripped packet per
+  skeleton, with a manifest mapping packets to articles and hashes. An
+  independent agent that has seen only the packet writes what it literally
+  asserts, in mathematical English, and files it as
+  `blueprint/readbacks/<article id>/<Lean name>.md` with `declaration`,
+  `skeleton`, and `model` frontmatter. Read-backs are testimony, not derived
+  state, so they are committed with the book. The
+  [read-back reference](../skills/human-review/references/readback.md) gives
+  the auditor its instructions; the practice follows Prove2me's mission audits.
+
+`--probe` adds three kernel-checked tests to the report. They are one-sided:
+a success is a finding, a failure says only that cheap automation did not get
+through, which is the expected case. Each attempt runs in an empty context
+under a heartbeat budget a tenth of Lean's default, with a fixed sweep of
+tactics (`rfl`, `trivial`, `simp`, `simp_all`, `omega`, `decide`, `exact?`,
+and with Mathlib also `norm_num`, `positivity`, `linarith`, `nlinarith`,
+`aesop`).
+
+- **Necessity probes** delete each propositional hypothesis of a theorem in
+  turn, and then all of them, and try to prove what remains. A success means
+  the conclusion did not need that hypothesis: either the book's hypothesis is
+  redundant, which is rare and worth knowing, or the formal conclusion is not
+  the book's. Reported as `hypothesis-unnecessary`.
+- **Definition checks** apply to propositional definitions: whether the
+  unfolded body holds of every input or of no input (`definition-trivial`),
+  whether an explicit argument is never used (`definition-unused-argument`),
+  and whether a clause of a conjunction follows from the others
+  (`definition-redundant-clause`). A degenerate definition also shows up in
+  every theorem that uses it, since a vacuous hypothesis is always deletable.
+- **Witnesses** are declarations named `<Def>.witness`, whose type ends in an
+  application of the definition, and `<Def>.counterexample`, whose type ends
+  in its negation, anywhere in the library. The report says whether each is
+  found, missing, of the wrong shape, or proved with `sorry`. A missing one is
+  advisory, because existence can be a hard theorem in its own right; a filed
+  one that is wrong is `witness-invalid`. The negative witness is the one that
+  catches vacuity and is almost always the easy one.
+
+Each theorem's packet also carries the statement *as written*, cut before its
+value by Lean's parser, beside the elaborated signature: the printed form
+shows binders that `variable` and `include` inject, the written form shows
+what the pretty-printer elides, and neither can hide what the other shows.
+
+A statement's source passage can travel with it. A `## Sources` link to a
+non-Markdown file inside the blueprint with a `#L<start>-L<end>` fragment, for
+example `../../../sources/lebl-ra/ch-real-nums.tex#L693-L714`, names the exact
+text the statement came from. `--passages DIR` writes those passages beside
+the packets, one per article, in a separate directory. Each article directory
+also holds `article.lean`, the joint packet of every declaration the article
+names, because a source theorem is often formalized by several declarations
+together and each alone is honestly incomplete. A faithfulness judge is given
+the article packet and its passage; a read-back auditor is given one
+declaration's packet alone, since a read-back is testimony about one
+declaration.
+
+`--mutants DIR` writes a calibration set for a faithfulness judge. Every
+statement is printed in one uniform elaborated form, and beside it every
+known-wrong variant the generator can make on the elaborated term: a
+propositional hypothesis dropped, `<` for `≤` and back, `∃` for `∀` and back
+on an object binder, `∧` for `∨` and back, the sides of a subtraction or
+division swapped, a numeral raised by one, the conclusion negated, a conjunct
+dropped, and for a propositional definition its body replaced by `True`. Every
+mutant typechecks by construction. Some are accidentally equivalent to the
+original, swapping the sides inside `|a - b|` for one; the generator tries to
+prove `original ↔ mutant` with the probes' cheap sweep and marks the ones it
+can, so detection rates are read net of them, and the rest are visible when
+reading the ones a judge misses. The unit of the set is the article, with one
+declaration mutated at a time. Packets
+are named opaquely with the passage beside each, and `labels.json` is the
+answer key a judge must never see. Judging originals and mutants alike, then
+scoring against the key, measures which operations the judge is blind to and
+binds each score on its scale to the changes it actually detects.
+
+`autoform audit … --skeleton skeleton.json` compares both with the current
+report, and reports the probe findings above: `skeleton-drift` names an approval whose skeleton has moved, and
+`readback-stale` or `readback-missing` names testimony that no longer applies
+or was never filed. `autoform render … --skeleton skeleton.json` adds a
+*Review* disclosure under every statement box, showing the skeleton, the
+assumed library notions, the axioms, the read-back with its currency, and the
+approval state, so a reviewer compares book text, Lean, and testimony without
+leaving the page. Read-backs are never published as pages of their own.
 
 Plan durable article identity metadata without changing the blueprint:
 

@@ -21,6 +21,13 @@ from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
 from .render import PublicationError, render_site
 from .scaffold import ScaffoldError, scaffold_project
+from .skeleton import (
+    SkeletonError,
+    extract_skeletons,
+    format_report,
+    write_harness,
+    write_packets,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -91,7 +98,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     article_ids.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
-    render = subparsers.add_parser
+    skeleton = subparsers.add_parser(
+        "skeleton",
+        help="extract what a reader must trust for each formalized statement",
+    )
+    skeleton.add_argument("blueprint_dir")
+    skeleton.add_argument(
+        "--lean-root",
+        type=Path,
+        required=True,
+        help="built Lean project whose declarations the blueprint names",
+    )
+    skeleton.add_argument(
+        "--node",
+        action="append",
+        dest="nodes",
+        metavar="ID",
+        help="restrict to one article id (repeatable)",
+    )
+    skeleton.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    skeleton.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="write the JSON report to this file instead of standard output",
+    )
+    skeleton.add_argument(
+        "--packets",
+        type=Path,
+        metavar="DIR",
+        help="also write one comment-stripped packet per skeleton for blind read-back auditors",
+    )
+    skeleton.add_argument(
+        "--passages",
+        type=Path,
+        metavar="DIR",
+        help="with --packets: also write each article's cited source passage, for a faithfulness judge",
+    )
+    skeleton.add_argument(
+        "--mutants",
+        type=Path,
+        metavar="DIR",
+        help="write a judge calibration set: every statement and its known-wrong mutants as uniform packets, with an answer key",
+    )
+    skeleton.add_argument(
+        "--probe",
+        action="store_true",
+        help="also run necessity probes, definition checks, and witness lookups with cheap automation (slower)",
+    )
 
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
@@ -119,6 +173,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _claim(args)
     if args.command == "migrate":
         return _migrate(args)
+    if args.command == "skeleton":
+        return _skeleton(args)
     if args.command == "render":
         return _render(args)
     return 2
@@ -291,6 +347,44 @@ def _migrate(args: argparse.Namespace) -> int:
             if not entry.assigned:
                 print(f"  {entry.article_path}: {entry.article_id}")
     return 1 if args.check and not plan.complete else 0
+
+
+def _skeleton(args: argparse.Namespace) -> int:
+    try:
+        report = extract_skeletons(
+            args.blueprint_dir,
+            lean_root=args.lean_root,
+            node_ids=tuple(args.nodes) if args.nodes else None,
+            probe=args.probe,
+            mutate=args.mutants is not None,
+        )
+    except SkeletonError as exc:
+        for issue in exc.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        return 2
+
+    if args.mutants is not None:
+        written = write_harness(report, args.mutants)
+        mutants = sum(len(declaration.mutants) for node in report.nodes for declaration in node.declarations)
+        print(f"{args.mutants}: {len(written)} packet(s) written, {mutants} of them mutants; labels.json is the answer key")
+    if args.packets is not None:
+        written = write_packets(report, args.packets, passages=args.passages)
+        print(f"{args.packets}: {len(written)} blind packet(s) written")
+        if args.passages is not None:
+            cited = sum(1 for node in report.nodes if node.passage is not None)
+            print(f"{args.passages}: {cited} source passage(s) written")
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(report.to_json() + "\n", encoding="utf-8")
+        declarations = sum(len(node.declarations) for node in report.nodes)
+        print(f"{args.output}: {declarations} skeleton(s) for {len(report.nodes)} article(s)")
+        for issue in report.unresolved:
+            print(f"error: {issue}")
+    elif args.json:
+        print(report.to_json())
+    else:
+        print(format_report(report, lean_root=args.lean_root), end="")
+    return 0 if report.clean else 1
 
 
 def _claim_board(args: argparse.Namespace) -> ClaimBoard:
