@@ -564,7 +564,9 @@ def test_a_line_locator_on_a_source_file_yields_the_passage(tmp_path: Path) -> N
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
     source = blueprint / "sources" / "book.tex"
     source.parent.mkdir()
-    source.write_text("\n".join(f"line {n}" for n in range(1, 21)) + "\n", encoding="utf-8")
+    # A form feed inside an earlier line, as `pdftotext` writes between pages,
+    # must not count as a line break: locators are what `sed` counts.
+    source.write_text("\n".join(f"line {n}" + ("\x0c" if n == 2 else "") for n in range(1, 21)) + "\n", encoding="utf-8")
     article = blueprint / "roadmap" / "basics" / "determined.md"
     article.write_text(
         article.read_text(encoding="utf-8").replace(

@@ -966,7 +966,11 @@ def source_passage(node: Node, blueprint: Path) -> tuple[str | None, str | None]
         candidate = (node.path.parent / path).resolve()
         try:
             candidate.relative_to(blueprint.resolve())
-            lines = candidate.read_text(encoding="utf-8").splitlines()
+            # Lines are what an editor or `sed` counts: newline-separated. Python's
+            # `splitlines` also breaks on form feeds, which `pdftotext` writes
+            # between pages, and every locator into such a file would then drift
+            # by one line per page.
+            lines = candidate.read_text(encoding="utf-8").split("\n")
         except (ValueError, OSError, UnicodeError):
             continue
         start = int(match.group(1))
@@ -1116,7 +1120,7 @@ def source_excerpt(item: TrustedDeclaration | DeclarationSkeleton, lean_root: Pa
     if item.path is None or item.start_line is None or item.end_line is None:
         return None
     try:
-        lines = (lean_root / item.path).read_text(encoding="utf-8").splitlines()
+        lines = (lean_root / item.path).read_text(encoding="utf-8").split("\n")
     except (OSError, UnicodeError):
         return None
     if item.start_line < 1 or item.end_line > len(lines) or item.end_line < item.start_line:
