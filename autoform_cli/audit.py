@@ -23,6 +23,8 @@ from .markdown import HEADING as _HEADING
 from .markdown import HTML_COMMENT as _HTML_COMMENT
 from .markdown import local_target_issue as _local_target_issue
 from .markdown import markdown_links as _markdown_links
+from .readback import load_readbacks, readback_findings
+from .skeleton import SkeletonReport
 
 #: More siblings than this at one level is a table of contents, not a chapter.
 _MAX_DIRECT_CHILDREN = 24
@@ -93,6 +95,7 @@ def audit_blueprint(
     blueprint_dir: str | Path,
     *,
     lean_root: str | Path | None = None,
+    skeleton: SkeletonReport | None = None,
 ) -> AuditResult:
     """Audit *blueprint_dir* using only local, committed-style source files.
 
@@ -122,6 +125,7 @@ def audit_blueprint(
         lean_root=lean_root,
         coverage=coverage,
         coverage_findings=coverage_findings,
+        skeleton=skeleton,
     )
 
 
@@ -131,6 +135,7 @@ def audit_graph(
     lean_root: str | Path | None = None,
     coverage: CoverageSummary | None = None,
     coverage_findings: list[AuditFinding] | None = None,
+    skeleton: SkeletonReport | None = None,
 ) -> AuditResult:
     """Audit an already loaded graph without modifying it or its source files."""
 
@@ -230,7 +235,56 @@ def audit_graph(
     findings.extend(coverage_findings)
     if lean_root is not None:
         findings.extend(_lean_findings(graph, lean_root))
+    if skeleton is not None:
+        findings.extend(_review_findings(graph, skeleton))
     return _result(findings, coverage=coverage)
+
+
+def _review_findings(graph: Graph, skeleton: SkeletonReport) -> list[AuditFinding]:
+    """Compare approvals and read-backs with the skeletons they testify about.
+
+    An approval names a hash. When the skeleton behind it has moved, the human
+    has not approved what is there now, and that is reported as drift rather
+    than left to stand. A read-back is held to the same standard, and a
+    formalized statement without one has no testimony a reviewer can compare.
+    """
+
+    findings: list[AuditFinding] = []
+    for node_id in sorted(graph.nodes):
+        node = graph.nodes[node_id]
+        article_path = _relative_path(node.path, graph.blueprint_dir)
+        record = skeleton.node(node_id)
+        if node.skeleton_approved is None:
+            continue
+        if record is None or not record.declarations:
+            findings.append(
+                AuditFinding(
+                    article_path,
+                    "skeleton-drift",
+                    f"skeleton_approved is {node.skeleton_approved} but no skeleton could be extracted for this article",
+                )
+            )
+        elif record.hash != node.skeleton_approved:
+            findings.append(
+                AuditFinding(
+                    article_path,
+                    "skeleton-drift",
+                    f"skeleton_approved is {node.skeleton_approved} but the current skeleton is {record.hash}; "
+                    "re-review the statement and update or remove the approval",
+                )
+            )
+    for record in skeleton.nodes:
+        node = graph.nodes.get(record.node_id)
+        article_path = _relative_path(node.path, graph.blueprint_dir) if node else record.node_id
+        for declaration in record.declarations:
+            for code, reason in declaration.findings:
+                findings.append(AuditFinding(article_path, code, reason))
+    readbacks = load_readbacks(graph.blueprint_dir)
+    for finding in readback_findings(skeleton, readbacks):
+        node = graph.nodes.get(finding.node_id)
+        article_path = _relative_path(node.path, graph.blueprint_dir) if node else finding.node_id
+        findings.append(AuditFinding(article_path, finding.code, finding.reason))
+    return findings
 
 
 @dataclass(frozen=True, slots=True)

@@ -23,6 +23,8 @@ from . import graph_pages, graph_views, mermaid, status
 from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, Node, load_graph
 from .lean import SourceLinker, build_linker, declaration_names
+from .readback import READBACKS_DIR, Readback, load_readbacks
+from .skeleton import DeclarationSkeleton, SkeletonReport
 from .status import is_definition
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
@@ -233,6 +235,7 @@ def render_site(
     repository_url: str | None = None,
     ref: str | None = None,
     clean: bool = True,
+    skeleton: SkeletonReport | None = None,
 ) -> RenderReport:
     """Write deterministic, read-only projections of the Markdown blueprint.
 
@@ -274,6 +277,7 @@ def render_site(
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
     sources_base = _sources_base(blueprint, repo_root, linker)
+    readbacks = load_readbacks(blueprint) if skeleton is not None else {}
 
     _prepare_destination(destination, clean=clean)
     _write_publication_manifest(
@@ -322,6 +326,10 @@ def render_site(
         # Source notes leave the site entirely once readers can reach them in
         # the repository, so the book has one reference surface rather than two.
         if sources_base is not None and relative.parts[:1] == (SOURCES_DIR,):
+            continue
+        # Read-backs are testimony about a statement, shown inside its box,
+        # never pages of their own.
+        if relative.parts[:1] == (READBACKS_DIR,):
             continue
         target = destination / relative
         # Directories are created on demand below, so a directory holding
@@ -385,6 +393,8 @@ def render_site(
             destination=destination,
             node_sources=node_sources,
             sources_base=sources_base,
+            skeleton=skeleton,
+            readbacks=readbacks,
         )
         page.write_text(chapter, encoding="utf-8")
         if narrative is None:  # a milestone with no narrative page of its own
@@ -1471,6 +1481,8 @@ def _render_chapter(
     destination: Path,
     node_sources: dict[Path, str],
     sources_base: "_SourceBase | None" = None,
+    skeleton: SkeletonReport | None = None,
+    readbacks: dict[tuple[str, str], Readback] | None = None,
 ) -> tuple[str, int, list[str]]:
     """Render one narrative article with statements at its authored link slots."""
     links = _anchored_links(targets, page)
@@ -1494,6 +1506,8 @@ def _render_chapter(
             node_sources=node_sources,
             targets=targets,
             sources_base=sources_base,
+            skeleton=skeleton,
+            readbacks=readbacks or {},
         )
         environments[node_id] = environment
         linked += node_linked
@@ -1583,6 +1597,8 @@ def _render_environment(
     node_sources: dict[Path, str],
     targets: dict[str, tuple[Path, str]],
     sources_base: "_SourceBase | None" = None,
+    skeleton: SkeletonReport | None = None,
+    readbacks: dict[tuple[str, str], Readback] | None = None,
 ) -> tuple[str, int, list[str]]:
     node_status = statuses[node.id]
     caption, _, number = numbers[node.id].rpartition(" ")
@@ -1649,8 +1665,141 @@ def _render_environment(
         lines.append(meta)
     if dependencies:
         lines.append(dependencies)
+    if skeleton is not None:
+        review = _review_disclosure(node, skeleton, readbacks or {})
+        if review:
+            lines.extend(["", review, ""])
     lines.append("</div>")
     return "\n".join(lines), linked, unresolved
+
+
+def _review_disclosure(
+    node: Node,
+    skeleton: SkeletonReport,
+    readbacks: dict[tuple[str, str], Readback],
+) -> str:
+    """Show what a reviewer must trust, and what a blind auditor says it means.
+
+    The skeleton is the reading list; the read-back is testimony about it. Both
+    sit under the statement, so the reviewer compares book text, Lean, and
+    testimony on one screen. Approval state is derived from the article's
+    ``skeleton_approved`` against the current hash, so a stale approval reads
+    as drift here exactly as it does in the audit.
+    """
+
+    record = skeleton.node(node.id)
+    if record is None or not record.declarations:
+        return ""
+    count = len(record.declarations)
+    lines_to_read = sum(item.skeleton_lines for item in record.declarations)
+    if node.skeleton_approved is None:
+        approval = ("bp-review-open", "not yet approved")
+    elif node.skeleton_approved == record.hash:
+        approval = ("bp-review-approved", f"approved · {record.hash}")
+    else:
+        approval = ("bp-review-drift", f"approval {node.skeleton_approved} predates the current skeleton {record.hash}")
+    summary = (
+        f"Review · {count} skeleton{'s' if count != 1 else ''}, {lines_to_read} lines to trust · "
+        f'<span class="{approval[0]}">{html.escape(approval[1])}</span>'
+    )
+    parts = ['<details class="bp-review" markdown="1">', f"<summary>{summary}</summary>", ""]
+    for declaration in record.declarations:
+        parts.extend(_skeleton_block(declaration))
+        readback = readbacks.get((node.id, declaration.name))
+        parts.extend(_readback_block(declaration, readback))
+    parts.append("</details>")
+    return "\n".join(parts)
+
+
+def _skeleton_block(declaration: DeclarationSkeleton) -> list[str]:
+    code = [html.escape(declaration.signature)]
+    if declaration.source is not None:
+        code.append(html.escape(declaration.source))
+    elif declaration.statement is not None:
+        code.append(html.escape("-- as written:"))
+        code.append(html.escape(declaration.statement))
+    for item in declaration.trusted:
+        where = item.path or item.module
+        if item.start_line is not None and item.end_line is not None:
+            where += f":{item.start_line}" if item.start_line == item.end_line else f":{item.start_line}-{item.end_line}"
+        code.append("")
+        code.append(html.escape(f"-- {item.kind} {item.name}  ({where})"))
+        code.append(html.escape(f"-- {item.signature}"))
+        if item.source is not None:
+            code.append(html.escape(item.source))
+    rows = [
+        ("Skeleton", f"<code>{html.escape(declaration.hash)}</code> · {declaration.skeleton_lines} lines"),
+        ("Assumes", ", ".join(f"<code>{html.escape(name)}</code>" for name in declaration.assumed) or "nothing beyond Lean core"),
+        ("Axioms", ", ".join(f"<code>{html.escape(name)}</code>" for name in declaration.axioms) or "none"),
+    ]
+    rows.extend(_probe_rows(declaration))
+    return [
+        '<div class="bp-skeleton">',
+        f'<div class="bp-skeleton-title">{html.escape(declaration.kind)} <code>{html.escape(declaration.name)}</code></div>',
+        f'<pre class="bp-lean"><code>{chr(10).join(code)}</code></pre>',
+        _render_rows(rows, css_class="bp-skeleton-meta"),
+        "</div>",
+        "",
+    ]
+
+
+def _probe_rows(declaration: DeclarationSkeleton) -> list[tuple[str, str]]:
+    """Necessity probes, definition checks, and witnesses as review rows.
+
+    A successful probe is drawn as a warning because it is a finding; a failed
+    one says only that cheap automation did not get through, which is the
+    expected case and is reported as such rather than as a pass.
+    """
+
+    rows: list[tuple[str, str]] = []
+    if declaration.probes:
+        flagged = [probe for probe in declaration.probes if probe.proved]
+        if flagged:
+            parts = []
+            for probe in flagged:
+                what = "every hypothesis" if probe.hypothesis == "*" else f"{probe.hypothesis} : {probe.hypothesis_type}"
+                parts.append(f'<span class="bp-probe-flag">proves without {html.escape(what)}</span> (by {html.escape(probe.tactic or "")})')
+            rows.append(("Probes", " · ".join(parts)))
+        else:
+            rows.append(("Probes", f"no hypothesis found unnecessary by cheap automation ({len(declaration.probes)} attempts)"))
+    if declaration.checks:
+        flagged = [check for check in declaration.checks if check.holds]
+        if flagged:
+            parts = [
+                f'<span class="bp-probe-flag">{html.escape(check.kind)}</span> {html.escape(check.detail)}'
+                + (f" (by {html.escape(check.tactic)})" if check.tactic and check.tactic != "syntactic" else "")
+                for check in flagged
+            ]
+            rows.append(("Checks", " · ".join(parts)))
+        else:
+            rows.append(("Checks", "not trivial, no unused argument, no redundant clause"))
+    if declaration.witnesses:
+        parts = []
+        for witness in declaration.witnesses:
+            css = "bp-witness-found" if witness.status == "found" else "bp-witness-open" if witness.status == "missing" else "bp-probe-flag"
+            parts.append(f'<span class="{css}">{html.escape(witness.role)} {html.escape(witness.status)}</span>')
+        rows.append(("Witnesses", " · ".join(parts)))
+    return rows
+
+
+def _readback_block(declaration: DeclarationSkeleton, readback: Readback | None) -> list[str]:
+    if readback is None:
+        return [
+            '<div class="bp-readback bp-readback-missing">No read-back filed for this skeleton yet.</div>',
+            "",
+        ]
+    status_key = readback.status(declaration)
+    label = "current" if status_key == "current" else f"stale · written for skeleton {readback.skeleton_hash or '?'}"
+    model = f" · {html.escape(readback.model)}" if readback.model else ""
+    return [
+        f'<div class="bp-readback bp-readback-{status_key}" markdown="1">',
+        f'<div class="bp-readback-title">Read-back{model} · <span class="bp-readback-status">{html.escape(label)}</span></div>',
+        "",
+        readback.text,
+        "",
+        "</div>",
+        "",
+    ]
 
 
 def _lean_presentation(
@@ -2426,6 +2575,48 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 }}
 .bp-dependencies summary:hover {{ color: var(--bp-link-hover); text-decoration: underline; }}
 .bp-dependency-body {{ margin-top: 0.35rem; color: var(--bp-fg); }}
+.bp-review {{
+  margin: 0.65rem 0 0 2rem;
+  font-family: {sans};
+  font-size: 0.82rem;
+  color: var(--bp-muted);
+}}
+.bp-review summary {{
+  width: fit-content;
+  cursor: pointer;
+  color: var(--bp-link);
+  user-select: none;
+}}
+.bp-review summary:hover {{ color: var(--bp-link-hover); text-decoration: underline; }}
+.bp-review-approved {{ color: #31A24C; font-weight: 600; }}
+.bp-review-open {{ color: var(--bp-muted); }}
+.bp-review-drift {{ color: #B77900; font-weight: 600; }}
+.bp-skeleton {{ margin-top: 0.6rem; color: var(--bp-fg); }}
+.bp-skeleton-title {{ font-weight: 600; margin-bottom: 0.3rem; }}
+.bp-lean {{
+  margin: 0 0 0.4rem;
+  padding: 0.6rem 0.8rem;
+  font-family: {mono};
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  border-left: 3px solid var(--bp-rule);
+}}
+.bp-skeleton-meta {{ margin-bottom: 0.5rem; }}
+.bp-probe-flag {{ color: #B77900; font-weight: 600; }}
+.bp-witness-found {{ color: #31A24C; }}
+.bp-witness-open {{ color: var(--bp-muted); }}
+.bp-readback {{
+  margin: 0.4rem 0 1rem;
+  padding: 0.6rem 0.8rem;
+  color: var(--bp-fg);
+  border-left: 3px solid #0064E0;
+}}
+.bp-readback-title {{ font-weight: 600; margin-bottom: 0.3rem; }}
+.bp-readback-status {{ font-weight: 400; color: var(--bp-muted); }}
+.bp-readback-stale {{ border-left-color: #B77900; }}
+.bp-readback-missing {{ border-left-color: var(--bp-rule); font-style: italic; }}
 .bp-row {{ display: flex; gap: 0.75rem; }}
 .bp-key {{
   flex: 0 0 7.5rem;
