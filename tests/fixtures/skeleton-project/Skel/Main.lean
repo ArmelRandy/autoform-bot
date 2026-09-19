@@ -18,4 +18,7 @@ theorem observation_determined (o : Observation Y) (h : NonAmbiguous o.admits) :
 
 theorem heavy_of_weight [HasWeight Y] (y : Y) (h : 0 < HasWeight.weight y) : heavy y := h
 
+/-- Neither hypothesis is needed: the necessity probes must say so. -/
+theorem needless (y : Y) (h : y = y) (h2 : NonAmbiguous (fun z : Y => z = y)) : y = y := rfl
+
 end Skel

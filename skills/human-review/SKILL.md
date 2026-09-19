@@ -48,7 +48,14 @@ the read-back on one screen; the kernel covers everything below.
 
 1. Extract the skeletons from the built project and write the blind packets,
    with the `skeleton` command in the [CLI reference](../../autoform_cli/README.md#commands):
-   `autoform skeleton blueprint --lean-root . --output skeleton.json --packets review-packets`.
+   `autoform skeleton blueprint --lean-root . --output skeleton.json --packets review-packets --probe`.
+   `--probe` runs the necessity probes, definition checks, and witness lookups;
+   it is slower, and its successes are the statements to show the person
+   first, since each one is a hypothesis the Lean did not need or a definition
+   that holds of everything or nothing. Ask the formalizer, not the reviewer,
+   to file `<Def>.witness` and `<Def>.counterexample` declarations for each
+   definition; a definition with no counterexample is a question for the
+   reviewer, not a failure.
 2. Obtain a read-back for every packet that has none or is stale. Never write
    one yourself: you know what the code is meant to say. For each packet,
    launch an independent sub-agent with a fresh context and give it only that

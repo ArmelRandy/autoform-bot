@@ -273,6 +273,12 @@ def _review_findings(graph: Graph, skeleton: SkeletonReport) -> list[AuditFindin
                     "re-review the statement and update or remove the approval",
                 )
             )
+    for record in skeleton.nodes:
+        node = graph.nodes.get(record.node_id)
+        article_path = _relative_path(node.path, graph.blueprint_dir) if node else record.node_id
+        for declaration in record.declarations:
+            for code, reason in declaration.findings:
+                findings.append(AuditFinding(article_path, code, reason))
     readbacks = load_readbacks(graph.blueprint_dir)
     for finding in readback_findings(skeleton, readbacks):
         node = graph.nodes.get(finding.node_id)

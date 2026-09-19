@@ -435,6 +435,133 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Necessity probes, definition checks, witnesses
+# --------------------------------------------------------------------------- #
+
+
+def _probed_record() -> str:
+    return "\n".join(
+        [
+            _record(
+                "Skel.needless",
+                found=True,
+                kind="theorem",
+                module="Skel.Main",
+                range=[20, 21],
+                signature="Skel.needless {Y : Type} (y : Y) (h : y = y) : y = y",
+                depends=[],
+                trusted=[],
+                assumed=[],
+                axioms=[],
+                probes=[
+                    {"hypothesis": "h", "type": "y = y", "statement": "∀ {Y : Type} (y : Y), y = y", "proved": True, "tactic": "rfl"},
+                ],
+                checks=[],
+                witnesses=[],
+            ),
+            _record(
+                "Skel.Always",
+                found=True,
+                kind="def",
+                module="Skel.Defs",
+                range=[30, 30],
+                signature="Skel.Always {Y : Type} (y : Y) : Prop",
+                depends=[],
+                trusted=[],
+                assumed=[],
+                axioms=[],
+                probes=[],
+                checks=[
+                    {"kind": "always", "detail": "holds of every input", "holds": True, "tactic": "rfl"},
+                    {"kind": "never", "detail": "holds of no input", "holds": False, "tactic": None},
+                    {"kind": "unused-argument", "detail": "y", "holds": True, "tactic": "syntactic"},
+                ],
+                witnesses=[
+                    {"role": "witness", "name": "Skel.Always.witness", "status": "missing"},
+                    {"role": "counterexample", "name": "Skel.Always.counterexample", "status": "mismatched"},
+                ],
+            ),
+        ]
+    )
+
+
+def test_probe_program_carries_the_tactic_sweep_only_when_asked() -> None:
+    plain = render_probe(imports=("Skel",), roots=("Skel.x",), project_roots=("Skel",))
+    probed = render_probe(imports=("Skel",), roots=("Skel.x",), project_roots=("Skel",), probe=True, tactics=("rfl", "aesop"))
+
+    assert "if false then AutoformProbe.report" in plain
+    assert "if true then AutoformProbe.report" in probed
+    assert '("aesop", ← `(tactic| (intros; aesop)))' in probed
+    assert "aesop" not in plain.split("def tactics")[1].split("]")[0]
+
+
+def test_probe_results_become_findings_and_report_lines(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"needless": "Skel.needless", "always": "Skel.Always"})
+
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _probed_record(), probe=True)
+
+    needless = report.nodes[1].declarations[0]
+    assert needless.probes[0].hypothesis_type == "y = y" and needless.probes[0].proved
+    assert needless.findings == (("hypothesis-unnecessary", "Skel.needless still proves by rfl with hypothesis h : y = y deleted"),)
+    always = report.nodes[0].declarations[0]
+    assert [code for code, _ in always.findings] == [
+        "definition-trivial",
+        "definition-unused-argument",
+        "witness-invalid",
+    ]
+    text = format_report(report)
+    assert "   probe: PROVES WITHOUT h : y = y (by rfl)\n" in text
+    assert "   check: ALWAYS holds of every input (by rfl)\n" in text
+    assert "   witnesses: witness missing · counterexample mismatched\n" in text
+    # The fields survive the JSON artifact.
+    path = tmp_path / "skeleton.json"
+    path.write_text(report.to_json(), encoding="utf-8")
+    assert load_skeleton_report(path) == report
+
+
+def test_mathlib_projects_get_the_larger_sweep(tmp_path: Path) -> None:
+    from autoform_cli.skeleton import CORE_TACTICS, MATHLIB_TACTICS, project_tactics
+
+    project = _project(tmp_path)
+    assert project_tactics(project) == CORE_TACTICS
+    (project / "lake-manifest.json").write_text('{"packages": [{"name": "mathlib"}]}', encoding="utf-8")
+    assert project_tactics(project) == CORE_TACTICS + MATHLIB_TACTICS
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_the_probe_flags_needless_hypotheses_and_degenerate_definitions(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    build = subprocess.run(["lake", "build"], cwd=project, capture_output=True, text=True, timeout=600, check=False)
+    assert build.returncode == 0, build.stderr
+    blueprint = _blueprint(
+        tmp_path,
+        lean={
+            "needless": "Skel.needless",
+            "determined": "Skel.observation_determined",
+            "always": "Skel.Always",
+            "ignores": "Skel.Ignores",
+            "redundant": "Skel.Redundant",
+            "nonambiguous": "Skel.NonAmbiguous",
+        },
+    )
+
+    report = extract_skeletons(blueprint, lean_root=project, probe=True)
+
+    by_name = {d.name: d for n in report.nodes for d in n.declarations}
+    needless = by_name["Skel.needless"]
+    assert {(p.hypothesis, p.proved) for p in needless.probes} == {("h", True), ("h2", True), ("*", True)}
+    assert all(not p.proved for p in by_name["Skel.observation_determined"].probes)
+    assert ("definition-trivial", "Skel.Always holds of every input (by rfl)") in by_name["Skel.Always"].findings
+    ignores = [code for code, _ in by_name["Skel.Ignores"].findings]
+    assert "definition-trivial" in ignores and "definition-unused-argument" in ignores
+    assert any(code == "definition-redundant-clause" for code, _ in by_name["Skel.Redundant"].findings)
+    assert {(w.role, w.status) for w in by_name["Skel.NonAmbiguous"].witnesses} == {("witness", "found"), ("counterexample", "found")}
+    assert {(w.role, w.status) for w in by_name["Skel.Always"].witnesses} == {("witness", "missing"), ("counterexample", "mismatched")}
+    assert by_name["Skel.NonAmbiguous"].findings == ()
+
+
+# --------------------------------------------------------------------------- #
 # Source passages
 # --------------------------------------------------------------------------- #
 

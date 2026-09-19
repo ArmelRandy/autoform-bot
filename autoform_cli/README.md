@@ -279,6 +279,7 @@ Extract what a reader must trust for each formalized statement:
 autoform skeleton blueprint --lean-root .
 autoform skeleton blueprint --lean-root . --node chapter/main-result
 autoform skeleton blueprint --lean-root . --output skeleton.json --packets review-packets --passages review-passages
+autoform skeleton blueprint --lean-root . --output skeleton.json --probe
 ```
 
 A theorem means what its statement means. The skeleton of a `lean:`
@@ -330,6 +331,33 @@ are pinned to that hash:
   [read-back reference](../skills/human-review/references/readback.md) gives
   the auditor its instructions; the practice follows Prove2me's mission audits.
 
+`--probe` adds three kernel-checked tests to the report. They are one-sided:
+a success is a finding, a failure says only that cheap automation did not get
+through, which is the expected case. Each attempt runs in an empty context
+under a heartbeat budget a tenth of Lean's default, with a fixed sweep of
+tactics (`rfl`, `trivial`, `simp`, `simp_all`, `omega`, `decide`, `exact?`,
+and with Mathlib also `norm_num`, `positivity`, `linarith`, `nlinarith`,
+`aesop`).
+
+- **Necessity probes** delete each propositional hypothesis of a theorem in
+  turn, and then all of them, and try to prove what remains. A success means
+  the conclusion did not need that hypothesis: either the book's hypothesis is
+  redundant, which is rare and worth knowing, or the formal conclusion is not
+  the book's. Reported as `hypothesis-unnecessary`.
+- **Definition checks** apply to propositional definitions: whether the
+  unfolded body holds of every input or of no input (`definition-trivial`),
+  whether an explicit argument is never used (`definition-unused-argument`),
+  and whether a clause of a conjunction follows from the others
+  (`definition-redundant-clause`). A degenerate definition also shows up in
+  every theorem that uses it, since a vacuous hypothesis is always deletable.
+- **Witnesses** are declarations named `<Def>.witness`, whose type ends in an
+  application of the definition, and `<Def>.counterexample`, whose type ends
+  in its negation, anywhere in the library. The report says whether each is
+  found, missing, of the wrong shape, or proved with `sorry`. A missing one is
+  advisory, because existence can be a hard theorem in its own right; a filed
+  one that is wrong is `witness-invalid`. The negative witness is the one that
+  catches vacuity and is almost always the easy one.
+
 Each theorem's packet also carries the statement *as written*, cut before its
 value by Lean's parser with the file's opened namespaces in scope so that
 scoped notation parses, beside the elaborated signature: the printed form
@@ -350,7 +378,7 @@ declaration's packet alone, since a read-back is testimony about one
 declaration.
 
 `autoform audit … --skeleton skeleton.json` compares both with the current
-report: `skeleton-drift` names an approval whose skeleton has moved, and
+report, and reports the probe findings above: `skeleton-drift` names an approval whose skeleton has moved, and
 `readback-stale` or `readback-missing` names testimony that no longer applies
 or was never filed. `autoform render … --skeleton skeleton.json` adds a
 *Review* disclosure under every statement box, showing the skeleton, the

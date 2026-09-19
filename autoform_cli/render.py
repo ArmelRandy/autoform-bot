@@ -1732,6 +1732,7 @@ def _skeleton_block(declaration: DeclarationSkeleton) -> list[str]:
         ("Assumes", ", ".join(f"<code>{html.escape(name)}</code>" for name in declaration.assumed) or "nothing beyond Lean core"),
         ("Axioms", ", ".join(f"<code>{html.escape(name)}</code>" for name in declaration.axioms) or "none"),
     ]
+    rows.extend(_probe_rows(declaration))
     return [
         '<div class="bp-skeleton">',
         f'<div class="bp-skeleton-title">{html.escape(declaration.kind)} <code>{html.escape(declaration.name)}</code></div>',
@@ -1740,6 +1741,45 @@ def _skeleton_block(declaration: DeclarationSkeleton) -> list[str]:
         "</div>",
         "",
     ]
+
+
+def _probe_rows(declaration: DeclarationSkeleton) -> list[tuple[str, str]]:
+    """Necessity probes, definition checks, and witnesses as review rows.
+
+    A successful probe is drawn as a warning because it is a finding; a failed
+    one says only that cheap automation did not get through, which is the
+    expected case and is reported as such rather than as a pass.
+    """
+
+    rows: list[tuple[str, str]] = []
+    if declaration.probes:
+        flagged = [probe for probe in declaration.probes if probe.proved]
+        if flagged:
+            parts = []
+            for probe in flagged:
+                what = "every hypothesis" if probe.hypothesis == "*" else f"{probe.hypothesis} : {probe.hypothesis_type}"
+                parts.append(f'<span class="bp-probe-flag">proves without {html.escape(what)}</span> (by {html.escape(probe.tactic or "")})')
+            rows.append(("Probes", " · ".join(parts)))
+        else:
+            rows.append(("Probes", f"no hypothesis found unnecessary by cheap automation ({len(declaration.probes)} attempts)"))
+    if declaration.checks:
+        flagged = [check for check in declaration.checks if check.holds]
+        if flagged:
+            parts = [
+                f'<span class="bp-probe-flag">{html.escape(check.kind)}</span> {html.escape(check.detail)}'
+                + (f" (by {html.escape(check.tactic)})" if check.tactic and check.tactic != "syntactic" else "")
+                for check in flagged
+            ]
+            rows.append(("Checks", " · ".join(parts)))
+        else:
+            rows.append(("Checks", "not trivial, no unused argument, no redundant clause"))
+    if declaration.witnesses:
+        parts = []
+        for witness in declaration.witnesses:
+            css = "bp-witness-found" if witness.status == "found" else "bp-witness-open" if witness.status == "missing" else "bp-probe-flag"
+            parts.append(f'<span class="{css}">{html.escape(witness.role)} {html.escape(witness.status)}</span>')
+        rows.append(("Witnesses", " · ".join(parts)))
+    return rows
 
 
 def _readback_block(declaration: DeclarationSkeleton, readback: Readback | None) -> list[str]:
@@ -2564,6 +2604,9 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
   border-left: 3px solid var(--bp-rule);
 }}
 .bp-skeleton-meta {{ margin-bottom: 0.5rem; }}
+.bp-probe-flag {{ color: #B77900; font-weight: 600; }}
+.bp-witness-found {{ color: #31A24C; }}
+.bp-witness-open {{ color: var(--bp-muted); }}
 .bp-readback {{
   margin: 0.4rem 0 1rem;
   padding: 0.6rem 0.8rem;
