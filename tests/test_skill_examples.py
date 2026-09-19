@@ -588,13 +588,16 @@ def test_review_skills_route_statement_review_through_the_cli_reference(repo_roo
     """Skills say what to achieve and link the CLI reference; flags live in one place."""
 
     human = (repo_root / "skills/human-review/SKILL.md").read_text(encoding="utf-8")
+    agent = (repo_root / "skills/agent-review/SKILL.md").read_text(encoding="utf-8")
     reference = (repo_root / "autoform_cli/README.md").read_text(encoding="utf-8")
     readback = (repo_root / "skills/human-review/references/readback.md").read_text(encoding="utf-8")
+    rubric = (repo_root / "skills/agent-review/references/formal-statement-faithfulness.md").read_text(encoding="utf-8")
 
     assert "../../autoform_cli/README.md#commands" in human
+    assert "references/formal-statement-faithfulness.md" in agent
     assert "references/readback.md" in human
-    for flag in ("--packets", "--passages", "--probe", "--skeleton"):
+    for flag in ("--packets", "--passages", "--probe", "--mutants", "--skeleton"):
         assert flag in reference, flag
     assert "skeleton_approved" in reference and "readbacks/" in reference
-    assert "Prove2me" in readback
+    assert "article.lean" in rubric and "Prove2me" in readback
     assert (repo_root / "autoform_cli/probes/skeleton_probe.lean").is_file()

@@ -163,6 +163,23 @@ class Witness:
 
 
 @dataclass(frozen=True, slots=True)
+class Mutant:
+    """A variant of a statement differing by one named operation.
+
+    ``equivalent`` is true when cheap automation proved the mutant equivalent
+    to the original, so it is not a wrong statement at all and a judge that
+    passes it is right. It is one-sided: false means nothing was proved.
+    """
+
+    kind: str
+    statement: str
+    equivalent: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {"equivalent": self.equivalent, "kind": self.kind, "statement": self.statement}
+
+
+@dataclass(frozen=True, slots=True)
 class DeclarationSkeleton:
     """The trusted surface of one root declaration."""
 
@@ -186,6 +203,30 @@ class DeclarationSkeleton:
     probes: tuple[HypothesisProbe, ...] = ()
     checks: tuple[DefinitionCheck, ...] = ()
     witnesses: tuple[Witness, ...] = ()
+    #: The statement printed in the uniform form mutants use, and its mutants.
+    printed: str | None = None
+    mutants: tuple[Mutant, ...] = ()
+
+    def harness_text(self, statement: str | None = None) -> str:
+        """A packet in the uniform printed form, for the original or a mutant.
+
+        Originals and mutants must be indistinguishable in shape, so both use
+        the printed elaborated form and neither carries the written statement.
+        """
+
+        lines = [
+            f"-- {self.kind} {self.name}",
+            f"-- assumed from libraries: {', '.join(self.assumed) if self.assumed else 'none'}",
+            f"-- axioms: {', '.join(self.axioms) if self.axioms else 'none'}",
+            "",
+            statement if statement is not None else (self.printed or self.signature),
+        ]
+        for item in self.trusted:
+            body = strip_lean_comments(item.source or "").strip("\n")
+            lines += ["", f"-- {item.kind} {item.name}", f"-- signature: {item.signature}"]
+            if body:
+                lines.append(body)
+        return "\n".join(lines) + "\n"
 
     @property
     def findings(self) -> tuple[tuple[str, str], ...]:
@@ -300,7 +341,9 @@ class DeclarationSkeleton:
             "kind": self.kind,
             "module": self.module,
             "name": self.name,
+            "mutants": [item.as_dict() for item in self.mutants],
             "path": self.path,
+            "printed": self.printed,
             "probes": [item.as_dict() for item in self.probes],
             "signature": self.signature,
             "skeleton_lines": self.skeleton_lines,
@@ -345,6 +388,14 @@ class NodeSkeleton:
 
         parts = [f"-- article with {len(self.declarations)} declaration(s)"]
         parts += [declaration.blind_text() for declaration in self.declarations]
+        return "\n".join(parts)
+
+    def harness_text(self, overrides: dict[str, str] | None = None) -> str:
+        """The article in the uniform printed form, with a mutant substituted for one declaration."""
+
+        overrides = overrides or {}
+        parts = [f"-- article with {len(self.declarations)} declaration(s)"]
+        parts += [declaration.harness_text(overrides.get(declaration.name)) for declaration in self.declarations]
         return "\n".join(parts)
 
     @property
@@ -453,6 +504,22 @@ def _declaration_from_dict(item: dict[str, object]) -> DeclarationSkeleton:
         probes=_probes(item.get("probes")),
         checks=_checks(item.get("checks")),
         witnesses=_witnesses(item.get("witnesses")),
+        printed=_optional_str(item.get("printed")),
+        mutants=_mutants(item.get("mutants")),
+    )
+
+
+def _mutants(value: object) -> tuple[Mutant, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        Mutant(
+            kind=str(item.get("kind") or "?"),
+            statement=str(item.get("statement") or ""),
+            equivalent=bool(item.get("equivalent")),
+        )
+        for item in value
+        if isinstance(item, dict)
     )
 
 
@@ -647,6 +714,7 @@ def render_probe(
     project_roots: tuple[str, ...],
     probe: bool = False,
     tactics: tuple[str, ...] = CORE_TACTICS,
+    mutate: bool = False,
 ) -> str:
     """Render the Lean program that extracts the skeleton of every root.
 
@@ -658,11 +726,14 @@ def render_probe(
         raise SkeletonError(["refusing to render a probe with no declarations"])
     if not imports:
         raise SkeletonError(["refusing to render a probe with no imports"])
+    equivalence = ["← `(tactic| (intros; simp [abs_sub_comm]))"] if "aesop" in tactics else []
     return _probe_template().format(
         budget=PROBE_BUDGET,
         core_roots=", ".join(_lean_name(name) for name in _CORE_MODULE_ROOTS),
+        equivalence_tactics=", ".join(equivalence) if equivalence else "← `(tactic| (intros; simp_all))",
         imports="\n".join(f"import {module}" for module in sorted(set(imports))),
         marker=PROBE_MARKER,
+        mutate_enabled="true" if mutate else "false",
         probe_enabled="true" if probe else "false",
         project_roots=", ".join(_lean_name(name) for name in sorted(set(project_roots))),
         roots=", ".join(_lean_name(name) for name in roots),
@@ -751,6 +822,7 @@ def extract_skeletons(
     runner: ProbeRunner | None = None,
     node_ids: tuple[str, ...] | None = None,
     probe: bool = False,
+    mutate: bool = False,
 ) -> SkeletonReport:
     """Extract the skeleton of every ``lean:`` declaration the blueprint names.
 
@@ -774,7 +846,8 @@ def extract_skeletons(
         runner=runner or run_probe,
         node_ids=node_ids,
         probe=probe,
-        tactics=project_tactics(root) if probe else CORE_TACTICS,
+        tactics=project_tactics(root) if (probe or mutate) else CORE_TACTICS,
+        mutate=mutate,
     )
 
 
@@ -788,6 +861,7 @@ def extract_graph_skeletons(
     node_ids: tuple[str, ...] | None = None,
     probe: bool = False,
     tactics: tuple[str, ...] = CORE_TACTICS,
+    mutate: bool = False,
 ) -> SkeletonReport:
     """Extract skeletons for an already loaded graph."""
 
@@ -832,6 +906,7 @@ def extract_graph_skeletons(
             project_roots=tuple(root for library in libraries for root in library.roots),
             probe=probe,
             tactics=tactics,
+            mutate=mutate,
         )
         records = parse_probe_output(runner(program, lean_root))
 
@@ -945,6 +1020,8 @@ def _declaration(
         probes=_probes(record.get("probes")),
         checks=_checks(record.get("checks")),
         witnesses=_witnesses(record.get("witnesses")),
+        printed=_optional_str(record.get("printed")),
+        mutants=_mutants(record.get("mutants")),
     )
     if not declaration.defines:
         return declaration
@@ -1186,6 +1263,70 @@ def _probe_lines(declaration: DeclarationSkeleton) -> list[str]:
     return lines
 
 
+HARNESS_LABELS = "labels.json"
+
+
+def write_harness(
+    report: SkeletonReport,
+    directory: str | Path,
+    *,
+    passages: bool = True,
+) -> list[Path]:
+    """Write a calibration set: every original and every mutant as uniform packets.
+
+    The unit is the article: an item is either an article as it stands or the
+    article with one declaration replaced by one of its mutants. Packets are
+    named opaquely, ``i0001.lean``, in a content-hashed order that groups
+    nothing, with the passage beside each as ``i0001.passage.txt`` when the
+    article cites one. ``labels.json`` maps each packet to its article, the
+    mutated declaration, the mutation, and whether the mutant was proved
+    equivalent to the original; it is the one file a judge must never read.
+    """
+
+    root = Path(directory).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    labels: list[dict[str, object]] = []
+    # One item is one article: the original, or the article with exactly one
+    # declaration replaced by one of its mutants.
+    items: list[tuple[NodeSkeleton, DeclarationSkeleton | None, Mutant | None]] = []
+    for node in report.nodes:
+        if not node.declarations:
+            continue
+        items.append((node, None, None))
+        for declaration in node.declarations:
+            for mutant in declaration.mutants:
+                items.append((node, declaration, mutant))
+    # Interleave so originals and mutants are not grouped, without randomness
+    # so the set is reproducible: sort by a hash of the content.
+    items.sort(
+        key=lambda item: hashlib.sha256(
+            (item[0].node_id + (item[1].name if item[1] else "") + (item[2].statement if item[2] else "")).encode()
+        ).hexdigest()
+    )
+    for index, (node, declaration, mutant) in enumerate(items, start=1):
+        stem = f"i{index:04d}"
+        packet = root / f"{stem}.lean"
+        overrides = {declaration.name: mutant.statement} if declaration and mutant else None
+        packet.write_text(node.harness_text(overrides), encoding="utf-8")
+        written.append(packet)
+        if passages and node.passage is not None:
+            (root / f"{stem}.passage.txt").write_text(node.passage + "\n", encoding="utf-8")
+        labels.append(
+            {
+                "declaration": declaration.name if declaration else None,
+                "equivalent": bool(mutant.equivalent) if mutant else False,
+                "hash": node.hash,
+                "item": stem,
+                "mutation": mutant.kind if mutant else "original",
+                "node_id": node.node_id,
+                "original": mutant is None,
+            }
+        )
+    (root / HARNESS_LABELS).write_text(json.dumps({"items": labels, "schema": SKELETON_SCHEMA}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return written
+
+
 def _trust_summary(declaration: DeclarationSkeleton) -> str:
     count = len(declaration.trusted)
     noun = "declaration" if count == 1 else "declarations"
@@ -1215,8 +1356,10 @@ __all__ = [
     "CORE_TACTICS",
     "DeclarationSkeleton",
     "DefinitionCheck",
+    "HARNESS_LABELS",
     "HypothesisProbe",
     "LeanLibrary",
+    "Mutant",
     "MATHLIB_TACTICS",
     "PROBE_BUDGET",
     "NodeSkeleton",
@@ -1239,5 +1382,6 @@ __all__ = [
     "run_probe",
     "source_excerpt",
     "source_passage",
+    "write_harness",
     "write_packets",
 ]
