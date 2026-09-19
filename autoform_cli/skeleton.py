@@ -112,6 +112,61 @@ class TrustedDeclaration:
 
 
 @dataclass(frozen=True, slots=True)
+class HypothesisProbe:
+    """One attempt to prove a theorem with a hypothesis deleted.
+
+    ``hypothesis`` is ``*`` when every propositional hypothesis was deleted at
+    once. ``proved`` is one-sided: true means cheap automation closed the
+    weakened statement, which is a finding; false means nothing was learned.
+    """
+
+    hypothesis: str
+    hypothesis_type: str
+    statement: str
+    proved: bool
+    tactic: str | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "hypothesis": self.hypothesis,
+            "hypothesis_type": self.hypothesis_type,
+            "proved": self.proved,
+            "statement": self.statement,
+            "tactic": self.tactic,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DefinitionCheck:
+    """One check on a propositional definition: ``always``, ``never``,
+    ``unused-argument``, or ``redundant-clause``. ``holds`` true is a finding."""
+
+    kind: str
+    detail: str
+    holds: bool
+    tactic: str | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {"detail": self.detail, "holds": self.holds, "kind": self.kind, "tactic": self.tactic}
+
+
+@dataclass(frozen=True, slots=True)
+class Witness:
+    """A ``<Def>.witness`` or ``<Def>.counterexample`` declaration, if filed.
+
+    ``status`` is ``found``, ``missing``, ``mismatched`` (wrong shape), or
+    ``sorry``. A missing witness is advisory; a filed one that is wrong is not.
+    """
+
+    role: str
+    name: str
+    status: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {"name": self.name, "role": self.role, "status": self.status}
+
+
+@dataclass(frozen=True, slots=True)
 class DeclarationSkeleton:
     """The trusted surface of one root declaration."""
 
@@ -138,6 +193,38 @@ class DeclarationSkeleton:
     #: elaborated signature is authoritative; this is what the author typed,
     #: shown beside it so neither form can hide what the other shows.
     statement: str | None = None
+    probes: tuple[HypothesisProbe, ...] = ()
+    checks: tuple[DefinitionCheck, ...] = ()
+    witnesses: tuple[Witness, ...] = ()
+
+    @property
+    def findings(self) -> tuple[tuple[str, str], ...]:
+        """``(code, reason)`` for every probe or check that succeeded."""
+
+        found: list[tuple[str, str]] = []
+        for probe in self.probes:
+            if probe.proved:
+                what = (
+                    "every hypothesis deleted"
+                    if probe.hypothesis == "*"
+                    else f"hypothesis {probe.hypothesis} : {probe.hypothesis_type} deleted"
+                )
+                found.append(("hypothesis-unnecessary", f"{self.name} still proves by {probe.tactic} with {what}"))
+        for check in self.checks:
+            if not check.holds:
+                continue
+            if check.kind in {"always", "never"}:
+                found.append(("definition-trivial", f"{self.name} {check.detail} (by {check.tactic})"))
+            elif check.kind == "unused-argument":
+                found.append(("definition-unused-argument", f"{self.name} never uses its argument {check.detail}"))
+            elif check.kind == "redundant-clause":
+                found.append(
+                    ("definition-redundant-clause", f"in {self.name} the clause {check.detail} follows from the others (by {check.tactic})")
+                )
+        for witness in self.witnesses:
+            if witness.status in {"mismatched", "sorry"}:
+                found.append(("witness-invalid", f"{witness.name} is filed as a {witness.role} but is {witness.status}"))
+        return tuple(found)
 
     @property
     def defines(self) -> bool:
@@ -231,6 +318,7 @@ class DeclarationSkeleton:
             "boundary_modules": [list(item) for item in self.boundary_modules],
             "axioms": list(self.axioms),
             "axiom_semantics": [list(item) for item in self.axiom_semantics],
+            "checks": [item.as_dict() for item in self.checks],
             "declaration_lines": self.declaration_lines,
             "end_line": self.end_line,
             "evidence_hash": self.evidence_hash,
@@ -240,6 +328,7 @@ class DeclarationSkeleton:
             "module": self.module,
             "name": self.name,
             "path": self.path,
+            "probes": [item.as_dict() for item in self.probes],
             "signature": self.signature,
             "semantic": self.semantic,
             "depends": list(self.depends),
@@ -248,6 +337,7 @@ class DeclarationSkeleton:
             "start_line": self.start_line,
             "statement": self.statement,
             "trusted": [item.as_dict() for item in self.trusted],
+            "witnesses": [item.as_dict() for item in self.witnesses],
         }
 
 
@@ -415,6 +505,9 @@ _DECLARATION_REPORT_FIELDS = frozenset(
         "start_line",
         "statement",
         "trusted",
+        "probes",
+        "checks",
+        "witnesses",
     }
 )
 _TRUSTED_REPORT_FIELDS = frozenset(
@@ -512,6 +605,9 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
         axiom_semantics=axiom_semantics,
         source=source,
         statement=_report_optional_string(item.get("statement"), f"statement for {name}"),
+        probes=_probes(item.get("probes")),
+        checks=_checks(item.get("checks")),
+        witnesses=_witnesses(item.get("witnesses")),
     )
     _validate_report_ranges(declaration.start_line, declaration.end_line, context=name)
     if item.get("hash") != declaration.hash:
@@ -551,6 +647,48 @@ def _trusted_from_dict(item: object, *, root: str) -> TrustedDeclaration:
     )
     _validate_report_ranges(trusted.start_line, trusted.end_line, context=name)
     return trusted
+
+
+
+def _probes(value: object) -> tuple[HypothesisProbe, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        HypothesisProbe(
+            hypothesis=str(item.get("hypothesis") or "?"),
+            hypothesis_type=str(item.get("hypothesis_type") or item.get("type") or ""),
+            statement=str(item.get("statement") or ""),
+            proved=bool(item.get("proved")),
+            tactic=_optional_probe_string(item.get("tactic")),
+        )
+        for item in value
+        if isinstance(item, dict)
+    )
+
+
+def _checks(value: object) -> tuple[DefinitionCheck, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        DefinitionCheck(
+            kind=str(item.get("kind") or "?"),
+            detail=str(item.get("detail") or ""),
+            holds=bool(item.get("holds")),
+            tactic=_optional_probe_string(item.get("tactic")),
+        )
+        for item in value
+        if isinstance(item, dict)
+    )
+
+
+def _witnesses(value: object) -> tuple[Witness, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        Witness(role=str(item.get("role") or "?"), name=str(item.get("name") or ""), status=str(item.get("status") or "?"))
+        for item in value
+        if isinstance(item, dict)
+    )
 
 
 def _report_string(value: object, context: str) -> str:
@@ -733,25 +871,58 @@ def _probe_template() -> str:
     return (Path(__file__).parent / "probes" / "skeleton_probe.lean").read_text(encoding="utf-8")
 
 
+#: The cheap automation a necessity probe may use. Order is cheapest first;
+#: `exact?` is last because it searches the whole environment.
+CORE_TACTICS: tuple[str, ...] = ("rfl", "trivial", "simp", "simp_all", "omega", "decide", "exact?")
+MATHLIB_TACTICS: tuple[str, ...] = ("norm_num", "positivity", "linarith", "nlinarith", "aesop")
+
+#: Heartbeats per tactic attempt, in `maxHeartbeats` option units. A tenth of
+#: Lean's default: a probe that needs more is not "cheap automation".
+PROBE_BUDGET = 20000
+
+
 def render_probe(
     *,
     imports: tuple[str, ...],
     roots: tuple[str, ...],
     project_roots: tuple[str, ...],
+    probe: bool = False,
+    tactics: tuple[str, ...] = CORE_TACTICS,
 ) -> str:
-    """Render the Lean program that extracts the skeleton of every root."""
+    """Render the Lean program that extracts the skeleton of every root.
+
+    With ``probe`` the program also runs the necessity probes, definition
+    checks, and witness lookups, using ``tactics`` as its automation sweep.
+    """
 
     if not roots:
         raise SkeletonError(["refusing to render a probe with no declarations"])
     if not imports:
         raise SkeletonError(["refusing to render a probe with no imports"])
     return _probe_template().format(
+        budget=PROBE_BUDGET,
         core_roots=", ".join(_lean_name(name) for name in _CORE_MODULE_ROOTS),
         imports="\n".join(f"import {module}" for module in sorted(set(imports))),
         marker=PROBE_MARKER,
+        probe_enabled="true" if probe else "false",
         project_roots=", ".join(_lean_name(name) for name in sorted(set(project_roots))),
         roots=", ".join(f"({json.dumps(name, ensure_ascii=False)}, {_lean_name(name)})" for name in roots),
+        tactics=", ".join(f'({json.dumps(name)}, ← `(tactic| (intros; {name})))' for name in tactics),
     )
+
+
+def project_tactics(lean_root: str | Path) -> tuple[str, ...]:
+    """Core automation, plus Mathlib's when the project depends on it."""
+
+    root = Path(lean_root).expanduser().resolve()
+    manifest = root / "lake-manifest.json"
+    has_mathlib = (root / ".lake" / "packages" / "mathlib").is_dir()
+    if not has_mathlib and manifest.is_file():
+        try:
+            has_mathlib = '"mathlib"' in manifest.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            has_mathlib = False
+    return CORE_TACTICS + MATHLIB_TACTICS if has_mathlib else CORE_TACTICS
 
 
 def _lean_name(name: str) -> str:
@@ -900,6 +1071,8 @@ _FOUND_RECORD_FIELDS = frozenset(
         "trusted",
     }
 )
+#: What `--probe` adds to a found record, absent otherwise.
+_PROBE_RESULT_FIELDS = frozenset({"probes", "checks", "witnesses"})
 _TRUSTED_RECORD_FIELDS = frozenset(
     {"depends", "kind", "module", "name", "range", "semantic", "semantic_schema", "signature", "source"}
 )
@@ -939,7 +1112,7 @@ def _validate_probe_record(record: dict[str, object], *, root: str) -> None:
     if type(found) is not bool:
         raise SkeletonError([f"the skeleton probe emitted a non-boolean found field for {root}"])
     expected_fields = _FOUND_RECORD_FIELDS if found else frozenset({"found", "root"})
-    if record.keys() != expected_fields:
+    if record.keys() - _PROBE_RESULT_FIELDS != expected_fields:
         raise SkeletonError([f"the skeleton probe emitted invalid fields for {root}"])
     if not found:
         return
@@ -1188,6 +1361,7 @@ def extract_skeletons(
     lean_root: str | Path,
     runner: ProbeRunner | None = None,
     node_ids: tuple[str, ...] | None = None,
+    probe: bool = False,
 ) -> SkeletonReport:
     """Extract the skeleton of every ``lean:`` declaration the blueprint names.
 
@@ -1210,6 +1384,8 @@ def extract_skeletons(
         index=index,
         runner=runner or run_probe,
         node_ids=node_ids,
+        probe=probe,
+        tactics=project_tactics(root) if probe else CORE_TACTICS,
     )
     if runner is None and index_project(root).source_digest != index.source_digest:
         raise SkeletonError(["Lean sources changed while skeletons were being extracted; retry after the build is idle"])
@@ -1224,6 +1400,8 @@ def extract_graph_skeletons(
     index: SourceIndex,
     runner: ProbeRunner,
     node_ids: tuple[str, ...] | None = None,
+    probe: bool = False,
+    tactics: tuple[str, ...] = CORE_TACTICS,
 ) -> SkeletonReport:
     """Extract skeletons for an already loaded graph."""
 
@@ -1255,10 +1433,20 @@ def extract_graph_skeletons(
     records: dict[str, dict[str, object]] = {}
     snapshot_started_ns: int | None = None
     if roots:
+        # Witnesses may live in any module of the library, so its root module
+        # is imported alongside the modules that hold the declarations.
+        library_roots = {
+            root
+            for library in libraries
+            for root in library.roots
+            if path_of(root, libraries, lean_root) is not None
+        }
         program = render_probe(
-            imports=tuple(sorted(imports)),
+            imports=tuple(sorted(imports | library_roots)),
             roots=tuple(roots),
             project_roots=tuple(root for library in libraries for root in library.roots),
+            probe=probe,
+            tactics=tactics,
         )
         snapshot_started_ns = time.time_ns()
         records = parse_probe_output(runner(program, lean_root), expected_roots=tuple(roots))
@@ -1394,6 +1582,9 @@ def _declaration(
         axiom_semantics=_semantic_pairs(record.get("axiom_semantics")),
         source=_optional_probe_string(record.get("source")),
         statement=_statement(record.get("statement_source")),
+        probes=_probes(record.get("probes")),
+        checks=_checks(record.get("checks")),
+        witnesses=_witnesses(record.get("witnesses")),
     )
     return declaration
 
@@ -1530,6 +1721,7 @@ def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> s
             if declaration.assumed:
                 out.append(f"   assumes: {', '.join(declaration.assumed)}")
             out.append(f"   axioms: {', '.join(declaration.axioms) if declaration.axioms else 'none'}")
+            out.extend(f"   {line}" for line in _probe_lines(declaration))
             for item in declaration.trusted:
                 out.append("")
                 out.append(f"   -- {item.kind} {item.name}  ({_where(item)})")
@@ -1884,6 +2076,30 @@ def write_packets(
     return written
 
 
+def _probe_lines(declaration: DeclarationSkeleton) -> list[str]:
+    """Summarize probes, checks, and witnesses for the text report."""
+
+    lines: list[str] = []
+    if declaration.probes:
+        flagged = [probe for probe in declaration.probes if probe.proved]
+        if flagged:
+            for probe in flagged:
+                what = "every hypothesis" if probe.hypothesis == "*" else f"{probe.hypothesis} : {probe.hypothesis_type}"
+                lines.append(f"probe: PROVES WITHOUT {what} (by {probe.tactic})")
+        else:
+            lines.append(f"probe: no hypothesis found unnecessary ({len(declaration.probes)} attempts)")
+    if declaration.checks:
+        flagged = [check for check in declaration.checks if check.holds]
+        if flagged:
+            for check in flagged:
+                lines.append(f"check: {check.kind.upper()} {check.detail}" + (f" (by {check.tactic})" if check.tactic else ""))
+        else:
+            lines.append(f"check: not trivial, no unused argument, no redundant clause ({len(declaration.checks)} checks)")
+    if declaration.witnesses:
+        lines.append("witnesses: " + " · ".join(f"{item.role} {item.status}" for item in declaration.witnesses))
+    return lines
+
+
 def _trust_summary(declaration: DeclarationSkeleton) -> str:
     count = len(declaration.trusted)
     noun = "declaration" if count == 1 else "declarations"
@@ -1911,14 +2127,20 @@ __all__ = [
     "PROBE_MARKER",
     "SEMANTIC_SCHEMA",
     "SKELETON_SCHEMA",
+    "CORE_TACTICS",
     "DeclarationSkeleton",
+    "DefinitionCheck",
+    "HypothesisProbe",
     "LeanLibrary",
+    "MATHLIB_TACTICS",
+    "PROBE_BUDGET",
     "NodeSkeleton",
     "PACKET_MANIFEST",
     "ProbeRunner",
     "SkeletonError",
     "SkeletonReport",
     "TrustedDeclaration",
+    "Witness",
     "extract_graph_skeletons",
     "extract_skeletons",
     "format_report",
@@ -1927,6 +2149,7 @@ __all__ = [
     "module_of",
     "parse_probe_output",
     "path_of",
+    "project_tactics",
     "render_probe",
     "run_probe",
     "source_excerpt",

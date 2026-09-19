@@ -27,4 +27,19 @@ def heavy [HasWeight Y] (y : Y) : Prop := 0 < HasWeight.weight y
 /-- Scoped notation: only parses where `Skel` is open. -/
 scoped notation "⟪" y "⟫" => HasWeight.weight y
 
+/-- Holds of everything: a vacuous definition the checks must flag. -/
+def Always (y : Y) : Prop := y = y
+
+/-- Ignores its argument and holds of nothing. -/
+def Ignores (y : Y) : Prop := False
+
+/-- The second clause follows from the first. -/
+def Redundant (S : Y → Prop) (y : Y) : Prop := Eligible S y ∧ S y
+
+theorem NonAmbiguous.witness : NonAmbiguous (fun z : Nat => z = 0) := fun y z hy hz => hy.trans hz.symm
+theorem NonAmbiguous.counterexample : ¬ NonAmbiguous (fun _ : Nat => True) :=
+  fun h => absurd (h 0 1 trivial trivial) (by decide)
+/-- Filed as a counterexample but has the wrong shape. -/
+theorem Always.counterexample : Always (1 : Nat) := rfl
+
 end Skel

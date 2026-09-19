@@ -140,6 +140,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="DIR",
         help="with --packets: also write each article's cited source passage, for a faithfulness judge",
     )
+    skeleton.add_argument(
+        "--probe",
+        action="store_true",
+        help="also run necessity probes, definition checks, and witness lookups with cheap automation (slower)",
+    )
 
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
@@ -376,6 +381,7 @@ def _skeleton(args: argparse.Namespace) -> int:
             args.blueprint_dir,
             lean_root=args.lean_root,
             node_ids=tuple(args.nodes) if args.nodes else None,
+            probe=args.probe,
         )
     except SkeletonError as exc:
         for issue in exc.issues:

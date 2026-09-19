@@ -595,7 +595,7 @@ def test_review_skills_route_statement_review_through_the_cli_reference(repo_roo
 
     assert "../../autoform_cli/README.md#commands" in human
     assert "references/readback.md" in human
-    for flag in ("--packets", "--passages", "--skeleton"):
+    for flag in ("--packets", "--passages", "--probe", "--skeleton"):
         assert flag in reference, flag
     assert "skeleton_approved" in reference and "readbacks/" in reference
     assert "Prove2me" in readback
