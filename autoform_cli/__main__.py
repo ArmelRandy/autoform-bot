@@ -338,6 +338,20 @@ def _migrate(args: argparse.Namespace) -> int:
 
 
 def _skeleton(args: argparse.Namespace) -> int:
+    if args.passages is not None and args.packets is None:
+        print("error: --passages requires --packets", file=sys.stderr)
+        return 2
+    if args.output is not None and args.packets is not None:
+        output = args.output.expanduser().resolve()
+        packet_outputs = [args.packets.expanduser().resolve()]
+        if args.passages is not None:
+            packet_outputs.append(args.passages.expanduser().resolve())
+        if any(
+            output == directory or output in directory.parents or directory in output.parents
+            for directory in packet_outputs
+        ):
+            print("error: --output must be disjoint from packet and passage directories", file=sys.stderr)
+            return 2
     try:
         report = extract_skeletons(
             args.blueprint_dir,
@@ -350,18 +364,28 @@ def _skeleton(args: argparse.Namespace) -> int:
         return 2
 
     if args.packets is not None:
-        written = write_packets(report, args.packets, passages=args.passages)
-        print(f"{args.packets}: {len(written)} blind packet(s) written")
+        try:
+            written = write_packets(report, args.packets, passages=args.passages)
+        except SkeletonError as exc:
+            for issue in exc.issues:
+                print(f"error: {issue}", file=sys.stderr)
+            return 2
+        stream = sys.stderr if args.json else sys.stdout
+        print(f"{args.packets}: {len(written)} blind packet(s) written", file=stream)
         if args.passages is not None:
             cited = sum(1 for node in report.nodes if node.passage is not None)
-            print(f"{args.passages}: {cited} source passage(s) written")
+            print(f"{args.passages}: {cited} source passage(s) written", file=stream)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(report.to_json() + "\n", encoding="utf-8")
         declarations = sum(len(node.declarations) for node in report.nodes)
-        print(f"{args.output}: {declarations} skeleton(s) for {len(report.nodes)} article(s)")
+        stream = sys.stderr if args.json else sys.stdout
+        print(
+            f"{args.output}: {declarations} skeleton(s) for {len(report.nodes)} article(s)",
+            file=stream,
+        )
         for issue in report.unresolved:
-            print(f"error: {issue}")
+            print(f"error: {issue}", file=stream)
     elif args.json:
         print(report.to_json())
     else:

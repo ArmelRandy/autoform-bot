@@ -374,6 +374,8 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert "autoform init" in setup
     assert "references/thesis-review-case.md" in agent_review
     assert "references/roadmap-quality.md" in agent_review
+    assert "stale-build refusal" in agent_review
+    assert "elaborated-semantic hash" in agent_review
     assert "autoform-visualize" in human_review
     assert "`approve`, `revise`, or\n`block`" in human_review
     for required in (
