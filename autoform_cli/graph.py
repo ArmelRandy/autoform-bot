@@ -35,8 +35,11 @@ _FRONTMATTER_KEYS = frozenset(
         "not_ready",
         "origin",
         "discussion",
+        "skeleton_approved",
+        "skeleton_evidence",
     }
 )
+_SKELETON_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _FORMALIZED = "formalized"
 _TRUE = frozenset({"true", "yes"})
 _FALSE = frozenset({"false", "no"})
@@ -89,6 +92,12 @@ class Node:
     depth: int = 0
     article_id: str | None = None
     source_sha256: str | None = None
+    #: The skeleton hash a human approved, from ``skeleton_approved``. The
+    #: audit compares it with the current skeleton and reports drift.
+    skeleton_approved: str | None = None
+    #: The evidence hash of the joint packet that person read, from
+    #: ``skeleton_evidence``; optional, checked when present.
+    skeleton_evidence: str | None = None
 
     @property
     def formalizable(self) -> bool:
@@ -220,6 +229,8 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
             depth=_article_depth(parsed_node.id, parents),
             article_id=metadata.get("article_id"),
             source_sha256=source_hashes[parsed_node.id],
+            skeleton_approved=metadata.get("skeleton_approved"),
+            skeleton_evidence=metadata.get("skeleton_evidence"),
         )
 
     if not issues:
@@ -475,6 +486,10 @@ def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tu
     if key == "origin":
         if folded not in {"cited", "bridged", "background"}:
             return value, f"{location}: 'origin' accepts cited, bridged, or background"
+        return folded, None
+    if key in {"skeleton_approved", "skeleton_evidence"}:
+        if not _SKELETON_HASH.fullmatch(folded):
+            return value, f"{location}: '{key}' must be a `sha256:<64 hex>` hash from `autoform skeleton`"
         return folded, None
     return value, None
 

@@ -25,6 +25,7 @@ from .skeleton import (
     SkeletonError,
     extract_skeletons,
     format_report,
+    load_skeleton_report,
     write_packets,
 )
 
@@ -62,6 +63,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit.add_argument("blueprint_dir")
     audit.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     audit.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    audit.add_argument(
+        "--skeleton",
+        type=Path,
+        help="skeleton report from `autoform skeleton --output`; checks approvals and read-backs against it",
+    )
 
     doctor = subparsers.add_parser("doctor", help="diagnose the local Markdown runtime contract")
     doctor.add_argument("project_or_blueprint")
@@ -126,7 +132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--packets",
         type=Path,
         metavar="DIR",
-        help="also write one comment-stripped packet per skeleton for blind auditors",
+        help="also write one comment-stripped packet per skeleton for blind read-back auditors",
     )
     skeleton.add_argument(
         "--passages",
@@ -145,6 +151,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--require-declarations",
         action="store_true",
         help="fail when a 'lean:' declaration is not found in the Lean sources",
+    )
+    render.add_argument(
+        "--skeleton",
+        type=Path,
+        help="skeleton report from `autoform skeleton --output`; adds a review disclosure to every statement",
     )
 
     args = parser.parse_args(argv)
@@ -255,7 +266,15 @@ def _check(args: argparse.Namespace) -> int:
 
 
 def _audit(args: argparse.Namespace) -> int:
-    result = audit_blueprint(args.blueprint_dir, lean_root=args.lean_root)
+    skeleton = None
+    if args.skeleton is not None:
+        try:
+            skeleton = load_skeleton_report(args.skeleton)
+        except SkeletonError as exc:
+            for issue in exc.issues:
+                print(f"error: {issue}", file=sys.stderr)
+            return 2
+    result = audit_blueprint(args.blueprint_dir, lean_root=args.lean_root, skeleton=skeleton)
     if args.json:
         print(result.to_json())
     else:
@@ -424,14 +443,16 @@ def _default_claim_scratch(repo: str, worker_id: str) -> Path:
 
 def _render(args: argparse.Namespace) -> int:
     try:
+        skeleton = load_skeleton_report(args.skeleton) if args.skeleton is not None else None
         report = render_site(
             args.blueprint_dir,
             args.output,
             lean_root=args.lean_root,
             repository_url=args.repository_url,
             ref=args.ref,
+            skeleton=skeleton,
         )
-    except (GraphValidationError, PublicationError) as exc:
+    except (GraphValidationError, PublicationError, SkeletonError) as exc:
         for issue in exc.issues:
             print(f"error: {issue}")
         return 1

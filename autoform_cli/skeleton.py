@@ -161,7 +161,12 @@ class DeclarationSkeleton:
 
     @property
     def hash(self) -> str:
-        """Fingerprint the probe's canonical elaborated meaning and trust boundary."""
+        """Fingerprint the probe's canonical elaborated meaning and trust boundary.
+
+        An approval or a read-back is testimony about one skeleton and records
+        this hash, so the audit can tell when the meaning has moved from under
+        the testimony; the evidence hash tells when the text shown has.
+        """
 
         material = {
             "axioms": list(self.axioms),
@@ -191,10 +196,9 @@ class DeclarationSkeleton:
     def blind_text(self) -> str:
         """The skeleton with every comment removed, for an auditor who must not see intent.
 
-        Testimony about what the code literally asserts is only evidence if
-        its author did not know what the code was meant to say. Docstrings say
-        exactly that, so they are stripped along with every other comment.
-        Names stay: they are part of the code.
+        A read-back is only evidence if its author did not know what the code
+        was meant to say. Docstrings say exactly that, so they are stripped
+        along with every other comment. Names stay: they are part of the code.
         """
 
         lines = [
@@ -264,9 +268,9 @@ class NodeSkeleton:
 
         A source theorem is often formalized by several declarations together,
         an existence half and a uniqueness half, say. Judged one at a time each
-        is honestly incomplete; judged together they are the statement. An
-        auditor asked what one declaration asserts still gets that declaration
-        alone.
+        is honestly incomplete; judged together they are the statement. The
+        read-back auditor still gets one declaration at a time, since a
+        read-back is testimony about one declaration.
         """
 
         parts = [f"-- article with {len(self.declarations)} declaration(s)"]
@@ -275,7 +279,7 @@ class NodeSkeleton:
 
     @property
     def hash(self) -> str:
-        """One hash over all of an article's skeletons, printed as the article skeleton."""
+        """What an article's ``skeleton_approved`` records: one hash over all its skeletons."""
 
         if len(self.declarations) == 1:
             return self.declarations[0].hash
@@ -1759,18 +1763,17 @@ def write_packets(
     *,
     passages: str | Path | None = None,
 ) -> list[Path]:
-    """Write one blind packet per skeleton for independent auditors.
+    """Write one blind packet per skeleton for independent read-back auditors.
 
     Each packet holds only what the auditor may see: the comment-stripped
     skeleton. Nothing names the article, the source, or the intent. The
     manifest beside the packets maps each file back to its article and hash so
-    testimony about a packet can be filed and checked, without the auditor
-    reading it.
+    the read-backs can be filed and checked, without the auditor reading it.
 
     With ``passages``, the source passage each article cites is written to a
     second directory, one ``passage.txt`` per article. A faithfulness judge
-    gets a packet and its passage; an auditor of one declaration gets the
-    packet alone, which is why the two never share a directory.
+    gets a packet and its passage; a read-back auditor gets the packet alone,
+    which is why the two never share a directory.
     """
 
     requested_root = Path(directory).expanduser()
