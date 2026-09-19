@@ -24,6 +24,9 @@ class HasWeight (Y : Type) where
 /-- Uses the class projection in its body. -/
 def heavy [HasWeight Y] (y : Y) : Prop := 0 < HasWeight.weight y
 
+/-- Scoped notation: only parses where `Skel` is open. -/
+scoped notation "⟪" y "⟫" => HasWeight.weight y
+
 /-- Holds of everything: a vacuous definition the checks must flag. -/
 def Always (y : Y) : Prop := y = y
 

@@ -390,6 +390,7 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
         lean={
             "determined": "Skel.observation_determined",
             "heavy": "Skel.heavy_of_weight",
+            "notation": "Skel.heavy_of_notation",
             "supervision": "Skel.supervision_nonAmbiguous, Skel.supervision",
         },
     )
@@ -398,11 +399,17 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
 
     assert report.clean
     determined = report.nodes[0].declarations[0]
+    # Scoped notation from a namespace the file opens still parses, and a cast
+    # is printed with the type it lands in.
+    notation = next(d for n in report.nodes for d in n.declarations if d.name == "Skel.heavy_of_notation")
+    assert notation.statement is not None
+    assert notation.statement.rstrip().endswith("Skel.heavy (1 : Nat)")
+    assert "(↑1 : Int)" in notation.signature or "(↑(1 : Nat) : Int)" in notation.signature
     # The statement as written is cut before the proof by Lean's parser.
     assert determined.statement is not None
     assert determined.statement.startswith("/-- Uses a structure in its statement")
     assert determined.statement.rstrip().endswith("∀ z, o.admits z → z = y")
-    assert ":= by" not in determined.statement and "sorry" not in determined.statement.split("-/")[-1]
+    assert ":=" not in determined.statement and "sorry" not in determined.statement.split("-/")[-1]
     blind = determined.blind_text()
     assert "-- as written:" in blind and ":= by" not in blind and "sorry in its proof" not in blind
     # The statement rests on two definitions and a structure. The helper lemma

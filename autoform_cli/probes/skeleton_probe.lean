@@ -11,6 +11,9 @@ open Lean Elab Command Meta Term
 
 -- A reader must see what is quantified over: `∃ n : ℕ, …`, not `∃ n, …`.
 set_option pp.funBinderTypes true
+-- and where a cast lands: `(↑n : ℚ)`, not `↑n`, since `1 / ↑n` means something
+-- else in `ℕ`.
+set_option pp.coercions.types true
 
 namespace AutoformProbe
 
@@ -394,6 +397,19 @@ def signatureOf (c : Name) : CommandElabM String := do
 partial def findKind? (stx : Syntax) (k : SyntaxNodeKind) : Option Syntax :=
   if stx.getKind == k then some stx else stx.getArgs.findSome? (findKind? · k)
 
+/-- The namespaces the file opens above `line`, from its `open …` commands. Their
+scoped notation (`#s`, `n !`, `∑ x ∈ s, f x`) must be active for the statement to
+parse; Lean records what a declaration means, not how its file was set up. -/
+def openedNamespaces (lines : List String) (line : Nat) : List Name :=
+  (lines.take (line - 1)).flatMap fun l =>
+    let l := l.trimAsciiStart.toString
+    if l.startsWith "open " then
+      ((l.toSubstring.drop 5).toString.splitOn " ")
+        |>.filter (fun t => t ≠ "" && t ≠ "scoped" && t ≠ "in")
+        |>.takeWhile (fun t => t ≠ "hiding" && t ≠ "renaming" && !t.startsWith "(")
+        |>.map String.toName
+    else []
+
 /-- The declaration's source up to its value: the statement as written, without
 the proof. Parsed with Lean's own parser rather than cut by pattern matching. -/
 def statementSource (root : Name) : CommandElabM (Option String) := do
@@ -406,6 +422,9 @@ def statementSource (root : Name) : CommandElabM (Option String) := do
   let text ← IO.FS.readFile path
   let lines := text.splitOn "\n"
   let snippet := "\n".intercalate (lines.drop (r.range.pos.line - 1) |>.take (r.range.endPos.line - r.range.pos.line + 1))
+  for ns in openedNamespaces lines r.range.pos.line do
+    if env.isNamespace ns then activateScoped ns
+  let env ← getEnv
   match Parser.runParserCategory env `command snippet with
   | .error _ => return none
   | .ok stx =>
@@ -414,7 +433,9 @@ def statementSource (root : Name) : CommandElabM (Option String) := do
       (findKind? decl ``Parser.Command.declValEqns).orElse fun _ => findKind? decl ``Parser.Command.whereStructInst
     let some v := val | return none
     let some pos := v.getPos? | return none
-    return some ((snippet.take pos.byteIdx).trimAsciiEnd.toString)
+    -- `pos` is a byte position: cut by bytes, not by characters, or every `∀`
+    -- before the value pushes the cut past it.
+    return some ((snippet.extract 0 pos).trimAsciiEnd.toString)
 
 def rangeJson (c : Name) : CommandElabM Json := do
   match ← findDeclarationRanges? c with

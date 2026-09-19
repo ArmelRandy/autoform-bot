@@ -359,9 +359,11 @@ and with Mathlib also `norm_num`, `positivity`, `linarith`, `nlinarith`,
   catches vacuity and is almost always the easy one.
 
 Each theorem's packet also carries the statement *as written*, cut before its
-value by Lean's parser, beside the elaborated signature: the printed form
-shows binders that `variable` and `include` inject, the written form shows
-what the pretty-printer elides, and neither can hide what the other shows.
+value by Lean's parser with the file's opened namespaces in scope so that
+scoped notation parses, beside the elaborated signature: the printed form
+shows binders that `variable` and `include` inject and the type every cast
+lands in, the written form shows what the pretty-printer elides, and neither
+can hide what the other shows.
 
 A statement's source passage can travel with it. A `## Sources` link to a
 non-Markdown file inside the blueprint with a `#L<start>-L<end>` fragment, for
