@@ -153,6 +153,205 @@ def report (root : Name) : CommandElabM (List (String × Json)) := do
 
 end AutoformProbe
 
+namespace AutoformMutate
+
+/-! Known-wrong variants of a statement, made on the elaborated term so every
+mutant typechecks by construction. They calibrate a faithfulness judge: each
+mutant differs in meaning from the original by one named operation, so a judge
+that scores it like the original is blind to that operation. -/
+
+/-- Replace the `target`-th occurrence, in pre-order with binders instantiated,
+of a subterm `pick` accepts. -/
+def replaceNth (e : Expr) (pick : Expr → MetaM (Option Expr)) (target : Nat) :
+    MetaM (Option Expr) := do
+  let counter ← IO.mkRef 0
+  let hit ← IO.mkRef false
+  let r ← Meta.transform e (pre := fun sub => do
+    match ← pick sub with
+    | some rep =>
+      let k ← counter.get
+      counter.set (k + 1)
+      if k == target then
+        hit.set true
+        return .done rep
+      return .continue
+    | none => return .continue)
+  if ← hit.get then return some r else return none
+
+def allMutants (e : Expr) (pick : Expr → MetaM (Option Expr)) (limit : Nat := 4) :
+    MetaM (List Expr) := do
+  let mut out := []
+  for i in [0:limit] do
+    match ← replaceNth e pick i with
+    | some m => out := out ++ [m]
+    | none => break
+  return out
+
+def swapRelation (from_ to_ : Name) (cls : Name) (e : Expr) : MetaM (Option Expr) := do
+  if e.isAppOfArity from_ 4 then
+    let args := e.getAppArgs
+    let α := args[0]!
+    try
+      let u ← getLevel α
+      let some v := u.dec | return none
+      let inst ← synthInstance (mkApp (mkConst cls [v]) α)
+      return some (mkAppN (mkConst to_ (e.getAppFn.constLevels!)) #[α, inst, args[2]!, args[3]!])
+    catch _ => return none
+  return none
+
+def pickStrictness (e : Expr) : MetaM (Option Expr) := do
+  if let some r ← swapRelation ``LT.lt ``LE.le ``LE e then return r
+  if let some r ← swapRelation ``LE.le ``LT.lt ``LT e then return r
+  return none
+
+def pickConnective (e : Expr) : MetaM (Option Expr) := do
+  if e.isAppOfArity ``And 2 then return some (mkAppN (mkConst ``Or) e.getAppArgs)
+  if e.isAppOfArity ``Or 2 then return some (mkAppN (mkConst ``And) e.getAppArgs)
+  return none
+
+def pickQuantifier (e : Expr) : MetaM (Option Expr) := do
+  if e.isAppOfArity ``Exists 2 then
+    match e.appArg! with
+    | .lam n ty b bi => return some (.forallE n ty b bi)
+    | _ => return none
+  match e with
+  | .forallE n ty b bi =>
+    -- an object binder the body depends on; never a type, an instance, or a hypothesis arrow
+    if b.hasLooseBVars && bi.isExplicit && !ty.isSort then
+      if ← isProp (.forallE n ty b bi) then
+        try return some (← mkAppM ``Exists #[Expr.lam n ty b bi]) catch _ => return none
+    return none
+  | _ => return none
+
+def pickSwapArgs (e : Expr) : MetaM (Option Expr) := do
+  for op in [``HSub.hSub, ``HDiv.hDiv] do
+    if e.isAppOfArity op 6 then
+      let args := e.getAppArgs
+      if ← isDefEq args[0]! args[1]! then
+        return some (mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, args[3]!, args[5]!, args[4]!])
+  return none
+
+def pickNumeral (e : Expr) : MetaM (Option Expr) := do
+  if e.isAppOfArity ``OfNat.ofNat 3 then
+    let args := e.getAppArgs
+    match args[1]!.nat? with
+    | some n =>
+      let lit := mkRawNatLit (n + 1)
+      try
+        let u ← getLevel args[0]!
+        let some v := u.dec | return none
+        let inst ← synthInstance (mkAppN (mkConst ``OfNat [v]) #[args[0]!, lit])
+        return some (mkAppN e.getAppFn #[args[0]!, lit, inst])
+      catch _ => return none
+    | none => return none
+  return none
+
+def pickers : List (String × (Expr → MetaM (Option Expr))) :=
+  [("strictness", pickStrictness), ("connective", pickConnective), ("quantifier", pickQuantifier),
+   ("swap-args", pickSwapArgs), ("numeral", pickNumeral)]
+
+/-- Mutants of a proposition `body` under the binders in scope: the pickers,
+then negation and dropped conjuncts. -/
+def mutateBody (body : Expr) : MetaM (List (String × Expr)) := do
+  let mut out : List (String × Expr) := []
+  for (kind, pick) in pickers do
+    for m in ← allMutants body pick do
+      out := out ++ [(kind, m)]
+  out := out ++ [("negate-conclusion", mkNot body)]
+  if body.isAppOfArity ``And 2 then
+    out := out ++ [("drop-conjunct", body.appFn!.appArg!), ("drop-conjunct", body.appArg!)]
+  return out
+
+def wellTyped (e : Expr) : MetaM Bool := do
+  try Meta.check e; isProp e catch _ => pure false
+
+/-- Whether cheap automation proves `original ↔ mutant`. One-sided: a success
+marks the mutant as equivalent, so a judge that passes it is right, not blind;
+a failure proves nothing. The sweep is the probes' sweep plus a split of the
+biconditional, and with Mathlib the symmetry of `|a - b|`, the equivalence the
+first calibration run met most often. -/
+def equivalent (original mutant : Expr) : TermElabM Bool := do
+  let goal := mkApp2 (Lean.mkConst ``Iff) original mutant
+  if (← AutoformProbe.attempt goal).isSome then return true
+  for tac in [← `(tactic| (intros; constructor <;> intro h <;> simp_all)), {equivalence_tactics}] do
+    let saved ← saveState
+    let ok ← tryCatchRuntimeEx
+      (withTheReader Core.Context (fun ctx => {{ ctx with maxHeartbeats := AutoformProbe.budget }}) <| Core.withCurrHeartbeats do
+        withLCtx {{}} {{}} do
+          let mvar ← mkFreshExprMVar goal
+          Term.runTactic mvar.mvarId! tac .term
+          let value ← instantiateMVars mvar
+          pure (!value.hasExprMVar && !value.hasSorry))
+      (fun _ => pure false)
+    restoreState saved
+    if ok then return true
+  return false
+
+/-- Mutants of a theorem statement, printed. Hypothesis drops are made at the
+telescope; everything else in the body. -/
+def theoremMutants (type : Expr) : TermElabM (Array Json) := do
+  let mut out : Array Json := #[]
+  let full ← forallTelescope type fun fvars body => do
+    let mut ms : List (String × Expr) := []
+    for fv in fvars do
+      if ← isProp (← inferType fv) then
+        let keep := fvars.filter (· != fv)
+        let g ← mkForallFVars keep body
+        unless g.hasAnyFVar (· == fv.fvarId!) do
+          ms := ms ++ [("drop-hypothesis", g)]
+    for (kind, m) in ← mutateBody body do
+      ms := ms ++ [(kind, ← mkForallFVars fvars m)]
+    return ms
+  for (kind, m) in full do
+    if m == type then continue
+    if ← wellTyped m then
+      out := out.push <| Json.mkObj [("kind", Json.str kind), ("statement", Json.str (toString (← ppExpr m))),
+        ("equivalent", Json.bool (← equivalent type m))]
+  return out
+
+/-- Mutants of a propositional definition's body, printed as `binders := body`,
+plus the hollow definition `True`. -/
+def definitionMutants (root : Name) (value : Expr) : TermElabM (Array Json) := do
+  lambdaTelescope value fun fvars body => do
+    unless ← isProp body do return #[]
+    let binders ← fvars.mapM fun fv => do
+      let decl ← fv.fvarId!.getDecl
+      return s!"({{decl.userName}} : {{← ppExpr decl.type}})"
+    let head := s!"{{root}} {{" ".intercalate binders.toList}} : Prop :="
+    let mut out : Array Json := #[]
+    let candidates := (← mutateBody body) ++ [("hollow", Lean.mkConst ``True)]
+    for (kind, m) in candidates do
+      if m == body then continue
+      if ← wellTyped m then
+        let same ← equivalent (← mkForallFVars fvars body) (← mkForallFVars fvars m)
+        out := out.push <| Json.mkObj [("kind", Json.str kind), ("statement", Json.str s!"{{head}} {{← ppExpr m}}"),
+          ("equivalent", Json.bool same)]
+    return out
+
+/-- The original in the same printed form the mutants use, so packets are uniform. -/
+def printedOriginal (root : Name) : TermElabM String := do
+  let some info := (← getEnv).find? root | return ""
+  match info with
+  | .defnInfo v =>
+    lambdaTelescope v.value fun fvars body => do
+      unless ← isProp body do return toString (← ppExpr info.type)
+      let binders ← fvars.mapM fun fv => do
+        let decl ← fv.fvarId!.getDecl
+        return s!"({{decl.userName}} : {{← ppExpr decl.type}})"
+      return s!"{{root}} {{" ".intercalate binders.toList}} : Prop := {{← ppExpr body}}"
+  | _ => return toString (← ppExpr info.type)
+
+def report (root : Name) : CommandElabM (List (String × Json)) := do
+  let some info := (← getEnv).find? root | return []
+  let mutants ← match info with
+    | .defnInfo v => liftTermElabM (definitionMutants root v.value)
+    | .thmInfo _ | .axiomInfo _ => liftTermElabM (theoremMutants info.type)
+    | _ => pure #[]
+  let original ← liftTermElabM (printedOriginal root)
+  return [("mutants", Json.arr mutants), ("printed", Json.str original)]
+
+end AutoformMutate
+
 namespace AutoformSkeleton
 
 /-- The probe-to-Python contract for elaborated declaration material. Bump this
@@ -493,6 +692,7 @@ def skeleton
       ("source", source)]
   let rootDeps := (edges.find? (·.1 == root)).map (·.2) |>.getD #[]
   let extra ← if {probe_enabled} then AutoformProbe.report root else pure []
+  let extra := extra ++ (← if {mutate_enabled} then AutoformMutate.report root else pure [])
   let statement := match ← statementSource root with | some s => Json.str s | none => Json.null
   let rootKind := kindOf env root
   let source ← if rootKind == "theorem" || rootKind == "axiom" then

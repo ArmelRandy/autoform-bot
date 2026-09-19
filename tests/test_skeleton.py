@@ -1400,3 +1400,62 @@ def load_skeleton_report_roundtrip(report, tmp_path: Path) -> bool:
     path = tmp_path / "r.json"
     path.write_text(report.to_json(), encoding="utf-8")
     return load_skeleton_report(path) == report
+
+
+# --------------------------------------------------------------------------- #
+# Mutants
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_mutants_are_known_wrong_variants_in_a_uniform_harness(tmp_path: Path) -> None:
+    from autoform_cli.skeleton import HARNESS_LABELS, write_harness
+
+    project = _project(tmp_path)
+    build = subprocess.run(["lake", "build"], cwd=project, capture_output=True, text=True, timeout=600, check=False)
+    assert build.returncode == 0, build.stderr
+    blueprint = _blueprint(
+        tmp_path,
+        lean={"needless": "Skel.needless", "determined": "Skel.observation_determined", "always": "Skel.Always", "observation": "Skel.Observation"},
+    )
+
+    report = extract_skeletons(blueprint, lean_root=project, mutate=True)
+
+    by_name = {d.name: d for n in report.nodes for d in n.declarations}
+    needless = by_name["Skel.needless"]
+    kinds = {m.kind for m in needless.mutants}
+    assert {"drop-hypothesis", "negate-conclusion"} <= kinds
+    assert needless.printed is not None and needless.printed.startswith("∀ {Y : Type} (y : Y), y = y →")
+    determined = by_name["Skel.observation_determined"]
+    assert {"connective", "quantifier", "drop-hypothesis", "negate-conclusion"} <= {m.kind for m in determined.mutants}
+    # a type binder is never turned into an existential
+    assert not any(m.statement.startswith("Exists fun {Y") for m in determined.mutants)
+    always = by_name["Skel.Always"]
+    assert always.printed == "Skel.Always (Y : Type) (y : Y) : Prop := y = y"
+    assert any(m.kind == "hollow" and m.statement.endswith(":= True") for m in always.mutants)
+
+    # A dropped hypothesis that was never used leaves an equivalent statement,
+    # and the generator proves it so: the answer key says so.
+    drops = [m for m in needless.mutants if m.kind == "drop-hypothesis"]
+    assert drops and all(m.equivalent for m in drops)
+    assert not any(m.equivalent for m in needless.mutants if m.kind == "negate-conclusion")
+
+    written = write_harness(report, tmp_path / "harness")
+    labels = json.loads((tmp_path / "harness" / HARNESS_LABELS).read_text(encoding="utf-8"))["items"]
+    assert len(written) == len(labels) == 4 + sum(len(d.mutants) for d in by_name.values())
+    originals = [item for item in labels if item["original"]]
+    assert {item["node_id"] for item in originals} == {node.node_id for node in report.nodes}
+    assert {item["declaration"] for item in labels if not item["original"]} == set(by_name) - {"Skel.Observation"}
+    assert any(item["equivalent"] for item in labels if item["mutation"] == "drop-hypothesis")
+    # every packet has the same shape: an article header, then uniform declaration packets
+    for item in labels:
+        text = (tmp_path / "harness" / f"{item['item']}.lean").read_text(encoding="utf-8")
+        assert text.startswith("-- article with 1 declaration(s)\n-- ")
+        assert "-- as written:" not in text
+        # the kernel's verdict would tell a judge which items were never mutated
+        assert "-- axioms:" not in text
+    # a structure has no mutants and keeps its fields, in the blind form
+    assert by_name["Skel.Observation"].mutants == ()
+    (original,) = [item for item in labels if item["original"] and item["node_id"].endswith("/observation")]
+    text = (tmp_path / "harness" / f"{original['item']}.lean").read_text(encoding="utf-8")
+    assert "structure Observation (Y : Type) where" in text and "admits : Y → Prop" in text

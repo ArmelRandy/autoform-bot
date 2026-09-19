@@ -20,6 +20,11 @@ Select the rubric from the artifact under review.
   and [Mathlib style](references/mathlib-style.md). Compile the relevant target,
   inspect the proof chain, and compare the complete public statement with the
   original source.
+- For one formalized statement against its source passage, read
+  [formal-statement faithfulness](references/formal-statement-faithfulness.md)
+  and judge from the blind packet that `autoform skeleton --packets` writes,
+  never from the article or the Lean file. This is the rubric for
+  statement-stage review, and it is the judge the mutation harness calibrates.
 
 Keep objective evidence separate from judgment. Never claim compilation,
 declaration resolution, axiom cleanliness, source coverage, or dependency

@@ -409,6 +409,30 @@ the article packet and its passage; a read-back auditor is given one
 declaration's packet alone, since a read-back is testimony about one
 declaration.
 
+`--mutants DIR` writes a calibration set for a faithfulness judge. Every
+statement is printed in one uniform elaborated form, and beside it every
+known-wrong variant the generator can make on the elaborated term: a
+propositional hypothesis dropped, `<` for `≤` and back, `∃` for `∀` and back
+on an object binder, `∧` for `∨` and back, the sides of a subtraction or
+division swapped, a numeral raised by one, the conclusion negated, a conjunct
+dropped, and for a propositional definition its body replaced by `True`. Every
+mutant typechecks by construction. Some are accidentally equivalent to the
+original, swapping the sides inside `|a - b|` for one; the generator tries to
+prove `original ↔ mutant` with the probes' cheap sweep and marks the ones it
+can, so detection rates are read net of them, and the rest are visible when
+reading the ones a judge misses. The unit of the set is the article, with one
+declaration mutated at a time. No harness packet lists axioms: a mutant is
+unproved by construction, and copying the original's axioms would let a
+dropped hypothesis pass as a kernel-proved generalization, so the rubric's
+two generalization rules do not apply in the harness and a real
+generalization in an original counts as a false alarm the report can see.
+Declarations that are never mutated, structures and data-valued definitions,
+appear in the blind form with their fields and bodies. Packets
+are named opaquely with the passage beside each, and `labels.json` is the
+answer key a judge must never see. Judging originals and mutants alike, then
+scoring against the key, measures which operations the judge is blind to and
+binds each score on its scale to the changes it actually detects.
+
 `autoform audit … --skeleton skeleton.json` compares both with the current
 report: `skeleton-drift` names an approval whose skeleton meaning has moved,
 `skeleton-evidence-drift` one whose recorded packet text has, and

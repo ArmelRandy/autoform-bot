@@ -26,6 +26,7 @@ from .skeleton import (
     extract_skeletons,
     format_report,
     load_skeleton_report,
+    write_harness,
     write_packets,
 )
 
@@ -139,6 +140,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         metavar="DIR",
         help="with --packets: also write each article's cited source passage, for a faithfulness judge",
+    )
+    skeleton.add_argument(
+        "--mutants",
+        type=Path,
+        metavar="DIR",
+        help="write a judge calibration set: every statement and its known-wrong mutants as uniform packets, with an answer key",
     )
     skeleton.add_argument(
         "--probe",
@@ -382,12 +389,17 @@ def _skeleton(args: argparse.Namespace) -> int:
             lean_root=args.lean_root,
             node_ids=tuple(args.nodes) if args.nodes else None,
             probe=args.probe,
+            mutate=args.mutants is not None,
         )
     except SkeletonError as exc:
         for issue in exc.issues:
             print(f"error: {issue}", file=sys.stderr)
         return 2
 
+    if args.mutants is not None:
+        written = write_harness(report, args.mutants)
+        mutants = sum(len(declaration.mutants) for node in report.nodes for declaration in node.declarations)
+        print(f"{args.mutants}: {len(written)} packet(s) written, {mutants} of them mutants; labels.json is the answer key")
     if args.packets is not None:
         try:
             written = write_packets(report, args.packets, passages=args.passages)
