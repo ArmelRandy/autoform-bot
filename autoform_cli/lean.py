@@ -139,6 +139,22 @@ def _strip_comments(line: str, depth: int) -> tuple[str, int]:
     return _LINE_COMMENT.sub("", "".join(out)), depth
 
 
+def strip_lean_comments(text: str) -> str:
+    """Remove every line and block comment, docstrings included, from Lean source.
+
+    Blank lines left behind are dropped, so the result is what the kernel sees
+    and nothing an author wrote for a reader.
+    """
+
+    depth = 0
+    kept: list[str] = []
+    for raw in text.splitlines():
+        line, depth = _strip_comments(raw, depth)
+        if line.strip():
+            kept.append(line.rstrip())
+    return "\n".join(kept)
+
+
 def declaration_names(lean: str) -> list[str]:
     """Split a ``lean:`` frontmatter value into individual declaration names."""
     return [name.strip() for name in lean.replace(",", " ").split() if name.strip()]
@@ -232,4 +248,5 @@ __all__ = [
     "detect_ref",
     "detect_repository_url",
     "index_project",
+    "strip_lean_comments",
 ]

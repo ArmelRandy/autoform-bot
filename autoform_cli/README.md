@@ -272,6 +272,76 @@ while it is still being decomposed, and the published `coverage.complete: false`
 is how a reader sees that. Run `autoform audit` in CI when you want mapped rows
 to block a merge.
 
+Extract what a reader must trust for each formalized statement:
+
+```bash
+autoform skeleton blueprint --lean-root .
+autoform skeleton blueprint --lean-root . --node chapter/main-result
+autoform skeleton blueprint --lean-root . --output skeleton.json --packets review-packets --passages review-passages
+```
+
+A theorem means what its statement means. The skeleton of a `lean:`
+declaration is the reading list a person needs to agree that the Lean says what
+the article claims: the elaborated signature, then every project declaration
+the *statement* rests on, transitively, quoted from the sources in dependency
+order. A definition contributes its body as well as its type, because the body
+is part of its meaning; a theorem met along the way contributes only its type.
+Proofs are never entered. The proof beneath a skeleton may be orders of
+magnitude longer, and it is the kernel's to check, not the reader's. Each
+skeleton also reports the axioms the declaration finally rests on, so a `sorry`
+shows up as `sorryAx` beside the statement rather than under it, and the
+non-core constants it assumes from Mathlib or another dependency, listed by
+name so a reader can see that a statement uses the library's notion of a limit
+rather than a homemade one.
+
+The closure is computed from elaborated terms, which is why this is the one
+command that runs Lean: it writes a small probe and runs it with
+`lake env lean` against the built project. A lexical closure would miss what
+`open`, notation, implicit instances, and auto-bound variables bring in, and
+every miss silently shrinks the surface a reader is told to trust. Constructors,
+projections, recursors, matchers, and equation lemmas are folded onto the
+declaration the reader sees in the source, so a structure appears once, as its
+`structure` block. Names outside the project are the trusted base and are not
+expanded. The command exits nonzero when a `lean:` name is absent from the
+sources or from the built environment, and it writes nothing into the vault;
+`--output` records the `autoform-skeleton/v1` report, which contains no
+timestamp or absolute path, for a later render or review to consume. The
+report quotes each trusted declaration's source, so it stands on its own.
+
+Every skeleton carries a sixteen-hex **hash** of its meaning: the elaborated
+signature and the comment-stripped text of every trusted declaration. A
+clearer docstring leaves it unchanged; any edit to a signature or a
+definition's body changes it. An article with several `lean:` names has one
+hash over all of them, printed as the article skeleton. The hash is how
+packets and reports are compared across builds: two reports differ on it
+exactly where a statement changed meaning, and testimony written about a
+packet can name the skeleton it was written about.
+
+`--packets DIR` writes one comment-stripped packet per skeleton, with a
+manifest mapping packets to articles and hashes. A packet holds only what a
+blind auditor may see: the signature, the statement as written, and the
+source of every project definition it rests on, with every comment and
+docstring removed, so that a reader who is asked what the Lean literally
+asserts cannot read the author's intent into it.
+
+Each theorem's packet also carries the statement *as written*, cut before its
+value by Lean's parser with the file's opened namespaces in scope so that
+scoped notation parses, beside the elaborated signature: the printed form
+shows binders that `variable` and `include` inject and the type every cast
+lands in, the written form shows what the pretty-printer elides, and neither
+can hide what the other shows.
+
+A statement's source passage can travel with it. A `## Sources` link to a
+non-Markdown file inside the blueprint with a `#L<start>-L<end>` fragment, for
+example `../../../sources/lebl-ra/ch-real-nums.tex#L693-L714`, names the exact
+text the statement came from. `--passages DIR` writes those passages beside
+the packets, one per article, in a separate directory. Each article directory
+also holds `article.lean`, the joint packet of every declaration the article
+names, because a source theorem is often formalized by several declarations
+together and each alone is honestly incomplete. A judge of faithfulness is
+given the article packet and its passage; an auditor asked what one
+declaration asserts is given that declaration's packet alone.
+
 Plan durable article identity metadata without changing the blueprint:
 
 ```bash
