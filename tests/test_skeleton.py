@@ -617,7 +617,10 @@ def test_mutants_are_known_wrong_variants_in_a_uniform_harness(tmp_path: Path) -
     project = _project(tmp_path)
     build = subprocess.run(["lake", "build"], cwd=project, capture_output=True, text=True, timeout=600, check=False)
     assert build.returncode == 0, build.stderr
-    blueprint = _blueprint(tmp_path, lean={"needless": "Skel.needless", "determined": "Skel.observation_determined", "always": "Skel.Always"})
+    blueprint = _blueprint(
+        tmp_path,
+        lean={"needless": "Skel.needless", "determined": "Skel.observation_determined", "always": "Skel.Always", "observation": "Skel.Observation"},
+    )
 
     report = extract_skeletons(blueprint, lean_root=project, mutate=True)
 
@@ -642,13 +645,20 @@ def test_mutants_are_known_wrong_variants_in_a_uniform_harness(tmp_path: Path) -
 
     written = write_harness(report, tmp_path / "harness")
     labels = json.loads((tmp_path / "harness" / HARNESS_LABELS).read_text(encoding="utf-8"))["items"]
-    assert len(written) == len(labels) == 3 + sum(len(d.mutants) for d in by_name.values())
+    assert len(written) == len(labels) == 4 + sum(len(d.mutants) for d in by_name.values())
     originals = [item for item in labels if item["original"]]
     assert {item["node_id"] for item in originals} == {node.node_id for node in report.nodes}
-    assert {item["declaration"] for item in labels if not item["original"]} == set(by_name)
+    assert {item["declaration"] for item in labels if not item["original"]} == set(by_name) - {"Skel.Observation"}
     assert any(item["equivalent"] for item in labels if item["mutation"] == "drop-hypothesis")
     # every packet has the same shape: an article header, then uniform declaration packets
     for item in labels:
         text = (tmp_path / "harness" / f"{item['item']}.lean").read_text(encoding="utf-8")
         assert text.startswith("-- article with 1 declaration(s)\n-- ")
         assert "-- as written:" not in text
+        # the kernel's verdict would tell a judge which items were never mutated
+        assert "-- axioms:" not in text
+    # a structure has no mutants and keeps its fields, in the blind form
+    assert by_name["Skel.Observation"].mutants == ()
+    (original,) = [item for item in labels if item["original"] and item["node_id"].endswith("/observation")]
+    text = (tmp_path / "harness" / f"{original['item']}.lean").read_text(encoding="utf-8")
+    assert "structure Observation (Y : Type) where" in text and "admits : Y → Prop" in text

@@ -212,12 +212,19 @@ class DeclarationSkeleton:
 
         Originals and mutants must be indistinguishable in shape, so both use
         the printed elaborated form and neither carries the written statement.
+        No axioms are listed either: a mutant is unproved by construction, and
+        copying the original's axioms would let a dropped hypothesis pass as a
+        kernel-proved generalization. A declaration that has no mutants, such
+        as a structure or a data-valued definition, is shown in the blind form
+        instead, so its fields and body stay visible; it appears the same way in
+        every item, so nothing about which item is mutated leaks.
         """
 
+        if statement is None and not self.mutants:
+            return self.blind_text(axioms=False)
         lines = [
             f"-- {self.kind} {self.name}",
             f"-- assumed from libraries: {', '.join(self.assumed) if self.assumed else 'none'}",
-            f"-- axioms: {', '.join(self.axioms) if self.axioms else 'none'}",
             "",
             statement if statement is not None else (self.printed or self.signature),
         ]
@@ -299,18 +306,23 @@ class DeclarationSkeleton:
         digest = hashlib.sha256(json.dumps(material, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         return digest[:16]
 
-    def blind_text(self) -> str:
+    def blind_text(self, *, axioms: bool = True) -> str:
         """The skeleton with every comment removed, for an auditor who must not see intent.
 
         A read-back is only evidence if its author did not know what the code
         was meant to say. Docstrings say exactly that, so they are stripped
         along with every other comment. Names stay: they are part of the code.
+        The axiom line is left out of harness packets, where the kernel's
+        verdict is not evidence.
         """
 
         lines = [
             f"-- {self.kind} {self.name}",
             f"-- assumed from libraries: {', '.join(self.assumed) if self.assumed else 'none'}",
-            f"-- axioms: {', '.join(self.axioms) if self.axioms else 'none'}",
+        ]
+        if axioms:
+            lines.append(f"-- axioms: {', '.join(self.axioms) if self.axioms else 'none'}")
+        lines += [
             "",
             self.signature,
         ]
@@ -1275,8 +1287,10 @@ def write_harness(
     """Write a calibration set: every original and every mutant as uniform packets.
 
     The unit is the article: an item is either an article as it stands or the
-    article with one declaration replaced by one of its mutants. Packets are
-    named opaquely, ``i0001.lean``, in a content-hashed order that groups
+    article with one declaration replaced by one of its mutants. No packet
+    lists axioms, since a mutant is unproved by construction and the kernel's
+    verdict on the original would tell a judge which items were never
+    mutated. Packets are named opaquely, ``i0001.lean``, in a content-hashed order that groups
     nothing, with the passage beside each as ``i0001.passage.txt`` when the
     article cites one. ``labels.json`` maps each packet to its article, the
     mutated declaration, the mutation, and whether the mutant was proved

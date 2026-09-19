@@ -28,6 +28,10 @@ You receive exactly two things, and nothing else may be consulted.
    is honestly incomplete. Findings from
    `autoform audit --skeleton` may be attached as facts; they are evidence of
    what the kernel established, never a substitute for the comparison below.
+   A packet with no axiom line, as the calibration harness writes them,
+   gives no evidence of a proof: `hypothesis-missing: generalizes` and
+   `conclusion-stronger: proved` are then unavailable, and the plain
+   categories apply.
 
 Do not open the article, the Lean file, the proof, neighbouring declarations,
 docstrings, or the web. Names are identifiers, not evidence: `WeilDivisor.Group`

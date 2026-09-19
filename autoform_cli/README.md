@@ -389,7 +389,13 @@ original, swapping the sides inside `|a - b|` for one; the generator tries to
 prove `original ↔ mutant` with the probes' cheap sweep and marks the ones it
 can, so detection rates are read net of them, and the rest are visible when
 reading the ones a judge misses. The unit of the set is the article, with one
-declaration mutated at a time. Packets
+declaration mutated at a time. No harness packet lists axioms: a mutant is
+unproved by construction, and copying the original's axioms would let a
+dropped hypothesis pass as a kernel-proved generalization, so the rubric's
+two generalization rules do not apply in the harness and a real
+generalization in an original counts as a false alarm the report can see.
+Declarations that are never mutated, structures and data-valued definitions,
+appear in the blind form with their fields and bodies. Packets
 are named opaquely with the passage beside each, and `labels.json` is the
 answer key a judge must never see. Judging originals and mutants alike, then
 scoring against the key, measures which operations the judge is blind to and
