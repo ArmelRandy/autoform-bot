@@ -83,6 +83,7 @@ An article asserts only facts a human or agent verified:
 | `not_ready: true` | Needs more blueprint work before it can be attempted. |
 | `lean: Ns.decl` | Declaration name(s) that discharge the article. |
 | `discussion: 42` | Issue number or URL where the article is being discussed. |
+| `skeleton_approved: 3f9a2c1d5e7b8a90` | A person approved the statement's skeleton with this hash. |
 
 Everything a reader thinks of as progress is *derived* from the DAG on every
 run, so it cannot go stale:
@@ -312,17 +313,22 @@ Every skeleton carries a sixteen-hex **hash** of its meaning: the elaborated
 signature and the comment-stripped text of every trusted declaration. A
 clearer docstring leaves it unchanged; any edit to a signature or a
 definition's body changes it. An article with several `lean:` names has one
-hash over all of them, printed as the article skeleton. The hash is how
-packets and reports are compared across builds: two reports differ on it
-exactly where a statement changed meaning, and testimony written about a
-packet can name the skeleton it was written about.
+hash over all of them, printed as the article skeleton. Two kinds of testimony
+are pinned to that hash:
 
-`--packets DIR` writes one comment-stripped packet per skeleton, with a
-manifest mapping packets to articles and hashes. A packet holds only what a
-blind auditor may see: the signature, the statement as written, and the
-source of every project definition it rests on, with every comment and
-docstring removed, so that a reader who is asked what the Lean literally
-asserts cannot read the author's intent into it.
+- **Approval.** When a person has compared the book statement with the
+  skeleton and agreed that the Lean says what the book says, the article
+  records `skeleton_approved: <article hash>`. It is an assertion, so it lives
+  in frontmatter like every other checked fact.
+- **Read-backs.** `--packets DIR` writes one comment-stripped packet per
+  skeleton, with a manifest mapping packets to articles and hashes. An
+  independent agent that has seen only the packet writes what it literally
+  asserts, in mathematical English, and files it as
+  `blueprint/readbacks/<article id>/<Lean name>.md` with `declaration`,
+  `skeleton`, and `model` frontmatter. Read-backs are testimony, not derived
+  state, so they are committed with the book. The
+  [read-back reference](../skills/human-review/references/readback.md) gives
+  the auditor its instructions; the practice follows Prove2me's mission audits.
 
 Each theorem's packet also carries the statement *as written*, cut before its
 value by Lean's parser with the file's opened namespaces in scope so that
@@ -338,9 +344,19 @@ text the statement came from. `--passages DIR` writes those passages beside
 the packets, one per article, in a separate directory. Each article directory
 also holds `article.lean`, the joint packet of every declaration the article
 names, because a source theorem is often formalized by several declarations
-together and each alone is honestly incomplete. A judge of faithfulness is
-given the article packet and its passage; an auditor asked what one
-declaration asserts is given that declaration's packet alone.
+together and each alone is honestly incomplete. A faithfulness judge is given
+the article packet and its passage; a read-back auditor is given one
+declaration's packet alone, since a read-back is testimony about one
+declaration.
+
+`autoform audit … --skeleton skeleton.json` compares both with the current
+report: `skeleton-drift` names an approval whose skeleton has moved, and
+`readback-stale` or `readback-missing` names testimony that no longer applies
+or was never filed. `autoform render … --skeleton skeleton.json` adds a
+*Review* disclosure under every statement box, showing the skeleton, the
+assumed library notions, the axioms, the read-back with its currency, and the
+approval state, so a reviewer compares book text, Lean, and testimony without
+leaving the page. Read-backs are never published as pages of their own.
 
 Plan durable article identity metadata without changing the blueprint:
 
