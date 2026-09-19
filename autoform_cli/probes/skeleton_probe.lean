@@ -404,7 +404,7 @@ def openedNamespaces (lines : List String) (line : Nat) : List Name :=
   (lines.take (line - 1)).flatMap fun l =>
     let l := l.trimAsciiStart.toString
     if l.startsWith "open " then
-      ((l.toSubstring.drop 5).toString.splitOn " ")
+      ((l.drop 5).toString.splitOn " ")
         |>.filter (fun t => t ≠ "" && t ≠ "scoped" && t ≠ "in")
         |>.takeWhile (fun t => t ≠ "hiding" && t ≠ "renaming" && !t.startsWith "(")
         |>.map String.toName
@@ -435,7 +435,8 @@ def statementSource (root : Name) : CommandElabM (Option String) := do
     let some pos := v.getPos? | return none
     -- `pos` is a byte position: cut by bytes, not by characters, or every `∀`
     -- before the value pushes the cut past it.
-    return some ((snippet.extract 0 pos).trimAsciiEnd.toString)
+    let bytes := snippet.toUTF8.extract 0 pos.byteIdx
+    return some ((String.fromUTF8! bytes).trimAsciiEnd.toString)
 
 def rangeJson (c : Name) : CommandElabM Json := do
   match ← findDeclarationRanges? c with

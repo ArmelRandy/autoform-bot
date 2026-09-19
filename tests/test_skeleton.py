@@ -428,7 +428,7 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
     # A local class reached through its projection is trusted once, as the class.
     assert [(item.name, item.kind) for item in heavy.trusted] == [("Skel.HasWeight", "class"), ("Skel.heavy", "def")]
 
-    supervision, definition = report.nodes[2].declarations
+    supervision, definition = next(n for n in report.nodes if n.node_id.endswith("/supervision")).declarations
     assert [item.name for item in supervision.trusted] == ["Skel.Eligible", "Skel.NonAmbiguous", "Skel.supervision"]
     assert supervision.axioms == ()
     assert definition.kind == "def" and definition.trusted == ()
