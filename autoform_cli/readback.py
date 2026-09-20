@@ -22,6 +22,8 @@ skeleton, rather than silently presenting stale evidence as current.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +32,8 @@ from .skeleton import DeclarationSkeleton, SkeletonReport
 
 READBACKS_DIR = "readbacks"
 READBACK_HEADING = "## Read-back"
+#: The only hash form a card may record: what `autoform skeleton` prints.
+_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +61,14 @@ class Readback:
 
 
 def readback_path(blueprint: Path, node_id: str, declaration: str) -> Path:
-    return blueprint / READBACKS_DIR / Path(*node_id.split("/")) / f"{declaration}.md"
+    """The card's place in the vault; refuses names that would leave the readbacks tree."""
+
+    parts = node_id.split("/")
+    if not node_id or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"invalid article id for a read-back: {node_id!r}")
+    if not declaration or "/" in declaration or "\\" in declaration or declaration in {".", ".."}:
+        raise ValueError(f"invalid declaration name for a read-back: {declaration!r}")
+    return blueprint / READBACKS_DIR / Path(*parts) / f"{declaration}.md"
 
 
 def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
@@ -68,7 +79,10 @@ def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
     if not root.is_dir():
         return found
     for path in sorted(root.rglob("*.md")):
-        if not path.is_file():
+        # A card is a file inside the vault; a symlink could point anywhere.
+        if path.is_symlink() or not path.is_file():
+            continue
+        if any((root / parent).is_symlink() for parent in path.relative_to(root).parents):
             continue
         relative = path.relative_to(root)
         node_id = relative.parent.as_posix()
@@ -81,8 +95,8 @@ def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
         found[(node_id, declaration)] = Readback(
             node_id=node_id,
             declaration=metadata.get("declaration") or declaration,
-            skeleton_hash=metadata.get("skeleton"),
-            packet_hash=metadata.get("packet"),
+            skeleton_hash=_hash_or_none(metadata.get("skeleton")),
+            packet_hash=_hash_or_none(metadata.get("packet")),
             model=metadata.get("model"),
             text=_testimony(body),
             path=path,
@@ -101,6 +115,8 @@ def write_readback(
     """File a read-back for ``declaration`` under the article it belongs to."""
 
     path = readback_path(Path(blueprint).expanduser().resolve(), node_id, declaration.name)
+    if path.is_symlink():
+        raise ValueError(f"refusing to write a read-back through a symlink: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     content = "\n".join(
         [
@@ -127,7 +143,10 @@ def write_readback(
             "",
         ]
     )
-    path.write_text(content, encoding="utf-8")
+    # Write whole or not at all: a reviewer never sees a half-written card.
+    staged = path.with_name(path.name + ".tmp")
+    staged.write_text(content, encoding="utf-8")
+    os.replace(staged, path)
     return path
 
 
@@ -166,8 +185,13 @@ def readback_findings(
                         node.node_id,
                         declaration.name,
                         "readback-stale",
-                        f"read-back for {declaration.name} testifies about skeleton "
-                        f"{readback.skeleton_hash or '?'}; the current skeleton is {declaration.hash}",
+                        (
+                            f"read-back for {declaration.name} testifies about skeleton "
+                            f"{readback.skeleton_hash}; the current skeleton is {declaration.hash}"
+                            if readback.skeleton_hash
+                            else f"read-back for {declaration.name} records no valid skeleton hash; "
+                            f"the current skeleton is {declaration.hash}"
+                        ),
                     )
                 )
             elif readback.status(declaration) == "revised":
@@ -181,6 +205,12 @@ def readback_findings(
                     )
                 )
     return findings
+
+
+def _hash_or_none(value: str | None) -> str | None:
+    """A recorded hash, or ``None`` when the card carries none or a malformed one."""
+
+    return value if value is not None and _HASH.fullmatch(value) else None
 
 
 def _testimony(body: str) -> str:

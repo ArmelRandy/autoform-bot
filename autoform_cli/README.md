@@ -347,7 +347,9 @@ these hashes:
   it as `blueprint/readbacks/<article id>/<Lean name>.md` with `declaration`,
   `skeleton` (the semantic hash), `packet` (the evidence hash of the packet it
   read), and `model` frontmatter. Read-backs are testimony, not derived
-  state, so they are committed with the book. The
+  state, so they are committed with the book; a card with a missing or
+  malformed hash is stale, a symlinked card is ignored, and a card is written
+  whole or not at all. The
   [read-back reference](../skills/human-review/references/readback.md) gives
   the auditor its instructions; the practice follows Prove2me's mission audits.
 

@@ -287,3 +287,37 @@ def test_render_marks_drift_and_missing_readbacks(tmp_path: Path) -> None:
 
     render_site(blueprint, tmp_path / "plain")
     assert "bp-review" not in (tmp_path / "plain" / "roadmap" / "basics" / "README.md").read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Cards are vault files and nothing else
+# --------------------------------------------------------------------------- #
+
+
+def test_card_paths_stay_inside_the_readbacks_tree(tmp_path: Path) -> None:
+    blueprint = _blueprint(tmp_path)
+    with pytest.raises(ValueError):
+        readback_path(blueprint, "../escape", "Skel.sup_unique")
+    with pytest.raises(ValueError):
+        readback_path(blueprint, "basics/sup-unique", "../Skel.sup_unique")
+    with pytest.raises(ValueError):
+        readback_path(blueprint, "basics//sup-unique", "Skel.sup_unique")
+
+
+def test_malformed_hashes_and_symlinked_cards_are_not_testimony(tmp_path: Path) -> None:
+    blueprint = _blueprint(tmp_path)
+    path = write_readback(blueprint, node_id="basics/sup-unique", declaration=_declaration(), model="m", text="Fine.")
+    path.write_text(path.read_text(encoding="utf-8").replace(_declaration().hash, "approved"), encoding="utf-8")
+
+    readback = load_readbacks(blueprint)[("basics/sup-unique", "Skel.sup_unique")]
+    assert readback.skeleton_hash is None and readback.status(_declaration()) == "stale"
+    (stale,) = readback_findings(_report(), load_readbacks(blueprint))
+    assert stale.code == "readback-stale" and "no valid skeleton hash" in stale.reason
+
+    outside = tmp_path / "outside.md"
+    outside.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    link = blueprint / "readbacks" / "basics" / "sup-unique" / "Skel.other.md"
+    link.symlink_to(outside)
+    assert ("basics/sup-unique", "Skel.other") not in load_readbacks(blueprint)
+    # a stray temporary file is never a half-written card
+    assert not path.with_name(path.name + ".tmp").exists()
