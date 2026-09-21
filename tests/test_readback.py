@@ -304,6 +304,40 @@ def test_card_paths_stay_inside_the_readbacks_tree(tmp_path: Path) -> None:
         readback_path(blueprint, "basics//sup-unique", "Skel.sup_unique")
 
 
+def test_a_card_that_shows_lean_it_does_not_record_is_reported(tmp_path: Path) -> None:
+    """The card is read in the vault, so the Lean it shows is the evidence."""
+
+    blueprint = _blueprint(tmp_path)
+    path = write_readback(blueprint, node_id="basics/sup-unique", declaration=_declaration(), model="m", text="Fine.")
+    assert load_readbacks(blueprint)[("basics/sup-unique", "Skel.sup_unique")].shows_what_it_attests
+    assert readback_findings(_report(), load_readbacks(blueprint)) == []
+
+    path.write_text(path.read_text(encoding="utf-8").replace("∀ x ∈ E, x ≤ b", "∀ x ∈ E, x < b"), encoding="utf-8")
+
+    readback = load_readbacks(blueprint)[("basics/sup-unique", "Skel.sup_unique")]
+    assert not readback.shows_what_it_attests
+    # the hashes still match the skeleton; only the displayed packet moved
+    assert readback.status(_declaration()) == "current"
+    (altered,) = readback_findings(_report(), load_readbacks(blueprint))
+    assert altered.code == "readback-altered" and readback.packet_hash in altered.reason
+
+
+def test_testimony_for_a_declaration_the_blueprint_dropped_is_reported(tmp_path: Path) -> None:
+    """A renamed statement must not leave testimony behind unmentioned."""
+
+    blueprint = _blueprint(tmp_path)
+    write_readback(blueprint, node_id="basics/sup-unique", declaration=_declaration(), model="m", text="Fine.")
+    renamed = DeclarationSkeleton(
+        **{**{name: getattr(_declaration(), name) for name in _declaration().__slots__}, "name": "Skel.sup_unique'"}
+    )
+
+    findings = readback_findings(_report(renamed), load_readbacks(blueprint))
+
+    assert sorted(finding.code for finding in findings) == ["readback-missing", "readback-orphaned"]
+    orphan = next(finding for finding in findings if finding.code == "readback-orphaned")
+    assert orphan.declaration == "Skel.sup_unique" and "renamed or removed" in orphan.reason
+
+
 def test_malformed_hashes_and_symlinked_cards_are_not_testimony(tmp_path: Path) -> None:
     blueprint = _blueprint(tmp_path)
     path = write_readback(blueprint, node_id="basics/sup-unique", declaration=_declaration(), model="m", text="Fine.")

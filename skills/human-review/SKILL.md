@@ -73,5 +73,6 @@ the read-back on one screen; the kernel covers everything below.
 5. Run `autoform audit blueprint --skeleton skeleton.json` before reporting.
    It names every approval whose skeleton has since moved (`skeleton-drift`)
    or whose packet text has (`skeleton-evidence-drift`), and every read-back
-   that is missing, stale, or revised, so an edit to a statement can never
-   keep an approval it was not given.
+   that is missing, stale, revised, altered after filing, or left behind by a
+   renamed statement, so an edit to a statement can never keep an approval it
+   was not given.

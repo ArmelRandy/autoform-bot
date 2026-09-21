@@ -349,7 +349,10 @@ these hashes:
   read), and `model` frontmatter. Read-backs are testimony, not derived
   state, so they are committed with the book; a card with a missing or
   malformed hash is stale, a symlinked card is ignored, and a card is written
-  whole or not at all. The
+  whole or not at all. A card also shows its packet verbatim, since a reviewer
+  reads it in the vault, and that block is hashed on load and compared with
+  the hash the card records. `model:` is a label the filer writes, not
+  provenance: nothing verifies who produced the testimony. The
   [read-back reference](../skills/human-review/references/readback.md) gives
   the auditor its instructions; the practice follows Prove2me's mission audits.
 
@@ -386,8 +389,10 @@ declaration.
 `autoform audit … --skeleton skeleton.json` compares both with the current
 report: `skeleton-drift` names an approval whose skeleton meaning has moved,
 `skeleton-evidence-drift` one whose recorded packet text has, and
-`readback-stale`, `readback-revised`, or `readback-missing` names testimony
-whose skeleton moved, whose packet text changed, or that was never filed. `autoform render … --skeleton skeleton.json` adds a
+`readback-stale`, `readback-revised`, `readback-altered`, `readback-orphaned`,
+or `readback-missing` names testimony whose skeleton moved, whose packet text
+changed, whose displayed Lean was edited after filing, that describes a
+declaration the blueprint no longer names, or that was never filed. `autoform render … --skeleton skeleton.json` adds a
 *Review* disclosure under every statement box, showing the skeleton, the
 assumed library notions, the axioms, the read-back with its currency, and the
 approval state, so a reviewer compares book text, Lean, and testimony without

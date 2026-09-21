@@ -73,7 +73,7 @@ helper writes this layout; only the text under `## Read-back` is published:
 declaration: RealAnalysis.isInf_one_div_nat
 skeleton: sha256:3f9a2c1d…   # the semantic hash, copied in full
 packet: sha256:8c4e1b2a…     # the evidence hash of the packet read, in full
-model: claude-fable-5-1
+model: claude-fable-5-1       # a label, not provenance: nothing verifies it
 ---
 
 # RealAnalysis.isInf_one_div_nat

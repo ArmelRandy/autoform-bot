@@ -28,12 +28,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .markdown import frontmatter_end
-from .skeleton import DeclarationSkeleton, SkeletonReport
+from .skeleton import DeclarationSkeleton, SkeletonReport, evidence_hash_of
 
 READBACKS_DIR = "readbacks"
 READBACK_HEADING = "## Read-back"
+SKELETON_HEADING = "## Skeleton"
 #: The only hash form a card may record: what `autoform skeleton` prints.
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
+#: The packet a card displays, between the skeleton heading and its fence.
+_SHOWN = re.compile(
+    r"^" + re.escape(SKELETON_HEADING) + r"\s*\n+```lean\n(?P<packet>.*?)\n```",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +55,20 @@ class Readback:
     #: The testimony alone, without the skeleton block the file also carries.
     text: str
     path: Path
+    #: The evidence hash of the packet the card *shows*, which a reviewer reads
+    #: beside the testimony. ``None`` when the card displays no packet.
+    shown_hash: str | None = None
+
+    @property
+    def shows_what_it_attests(self) -> bool:
+        """Whether the displayed packet is the one the card's hash names.
+
+        A card is read in the vault, so the Lean a reviewer sees is the
+        evidence. An edit to that block would otherwise leave the hashes
+        attesting to a packet nobody read.
+        """
+
+        return self.shown_hash is None or self.shown_hash == self.packet_hash
 
     def status(self, skeleton: DeclarationSkeleton) -> str:
         """``current``, ``revised`` (same meaning, packet text changed), or ``stale``."""
@@ -92,6 +112,7 @@ def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
         except (OSError, UnicodeError):
             continue
         metadata, body = _split(text)
+        shown = _SHOWN.search(body)
         found[(node_id, declaration)] = Readback(
             node_id=node_id,
             declaration=metadata.get("declaration") or declaration,
@@ -100,6 +121,7 @@ def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
             model=metadata.get("model"),
             text=_testimony(body),
             path=path,
+            shown_hash=evidence_hash_of(shown.group("packet") + "\n") if shown else None,
         )
     return found
 
@@ -194,6 +216,16 @@ def readback_findings(
                         ),
                     )
                 )
+            elif not readback.shows_what_it_attests:
+                findings.append(
+                    ReadbackFinding(
+                        node.node_id,
+                        declaration.name,
+                        "readback-altered",
+                        f"read-back for {declaration.name} shows a packet that is not the one it "
+                        f"records ({readback.packet_hash}); the card was edited after it was filed",
+                    )
+                )
             elif readback.status(declaration) == "revised":
                 findings.append(
                     ReadbackFinding(
@@ -204,6 +236,19 @@ def readback_findings(
                         f"{readback.packet_hash}; the packet text is now {declaration.evidence_hash}",
                     )
                 )
+    # Testimony about a declaration the blueprint no longer names is evidence
+    # for nothing, and would otherwise sit in the vault unmentioned forever.
+    named = {(node.node_id, declaration.name) for node in report.nodes for declaration in node.declarations}
+    for node_id, name in sorted(set(readbacks) - named):
+        findings.append(
+            ReadbackFinding(
+                node_id,
+                name,
+                "readback-orphaned",
+                f"read-back filed for {name} under {node_id}, which names no such declaration; "
+                "the statement was renamed or removed, so delete the card or restore the name",
+            )
+        )
     return findings
 
 

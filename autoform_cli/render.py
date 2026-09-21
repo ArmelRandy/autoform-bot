@@ -1751,8 +1751,10 @@ def _readback_block(declaration: DeclarationSkeleton, readback: Readback | None)
             '<div class="bp-readback bp-readback-missing">No read-back filed for this skeleton yet.</div>',
             "",
         ]
-    status_key = readback.status(declaration)
-    if status_key == "current":
+    status_key = "altered" if not readback.shows_what_it_attests else readback.status(declaration)
+    if status_key == "altered":
+        label = "altered · the Lean shown below is not the packet this card records"
+    elif status_key == "current":
         label = "current"
     elif status_key == "revised":
         label = "revised · the packet text changed since this was written"
@@ -2582,6 +2584,7 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 .bp-readback-status {{ font-weight: 400; color: var(--bp-muted); }}
 .bp-readback-stale {{ border-left-color: #B77900; }}
 .bp-readback-revised {{ border-left-color: #B77900; }}
+.bp-readback-altered {{ border-left-color: #B77900; }}
 .bp-readback-missing {{ border-left-color: var(--bp-rule); font-style: italic; }}
 .bp-row {{ display: flex; gap: 0.75rem; }}
 .bp-key {{
