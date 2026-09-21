@@ -83,8 +83,7 @@ An article asserts only facts a human or agent verified:
 | `not_ready: true` | Needs more blueprint work before it can be attempted. |
 | `lean: Ns.decl` | Declaration name(s) that discharge the article. |
 | `discussion: 42` | Issue number or URL where the article is being discussed. |
-| `skeleton_approved: sha256:<64 hex>` | A person approved the statement's skeleton at this semantic hash. |
-| `skeleton_evidence: sha256:<64 hex>` | The evidence hash of the joint packet that person read. |
+| `review_approved: sha256:<64 hex>` | A person approved the complete current review surface for this article. |
 
 Everything a reader thinks of as progress is *derived* from the DAG on every
 run, so it cannot go stale:
@@ -331,30 +330,25 @@ written about.
 
 Reports and packet manifests also carry an evidence hash over the exact
 proof-free text shown to a reviewer. Semantic hashes survive presentation-only
-edits; evidence hashes ensure an approval is attached to the bytes that were
-actually reviewed. An article review hash additionally binds the joint packet
-to the cited passage and its locator. Two kinds of testimony are pinned to
-these hashes:
+edits; evidence hashes identify the bytes that were actually read. Human
+approval does not record either hash alone. It records one `review_approved`
+hash over the complete review surface: the article's title and statement, cited source
+passage and locator, exact joint packet, and every validated read-back card.
+Changing any reviewed input invalidates the approval.
 
-- **Approval.** When a person has compared the book statement with the
-  skeleton and agreed that the Lean says what the book says, the article
-  records `skeleton_approved: <article hash>`, the semantic hash, and
-  `skeleton_evidence: <article evidence hash>` for the exact joint packet
-  that was read. Both are assertions, so they live in frontmatter like every
-  other checked fact; the evidence key is optional, the semantic key is not.
-- **Read-backs.** An independent agent that has seen only one declaration's
-  packet writes what it literally asserts, in mathematical English, and files
-  it as `blueprint/readbacks/<article id>/<Lean name>.md` with `declaration`,
-  `skeleton` (the semantic hash), `packet` (the evidence hash of the packet it
-  read), and `model` frontmatter. Read-backs are testimony, not derived
-  state, so they are committed with the book; a card with a missing or
-  malformed hash is stale, a symlinked card is ignored, and a card is written
-  whole or not at all. A card also shows its packet verbatim, since a reviewer
-  reads it in the vault, and that block is hashed on load and compared with
-  the hash the card records. `model:` is a label the filer writes, not
-  provenance: nothing verifies who produced the testimony. The
-  [read-back reference](../skills/human-review/references/readback.md) gives
-  the auditor its instructions; the practice follows Prove2me's mission audits.
+A read-back is an independent agent's mathematical-English account of one
+declaration packet. The coordinator gives that agent only an opaque packet and
+the read-back instructions, then records the returned testimony through the
+CLI. Cards live at
+`blueprint/readbacks/<article_id>/<encoded-declaration>.md`; the durable
+`article_id` keeps testimony attached when an article moves, while the encoded
+filename avoids platform-specific Lean-name collisions. Each versioned card
+contains the exact packet, both hashes, a model label, and nonempty testimony.
+The loader rejects missing or unknown fields, altered packets, identity
+mismatches, and malformed or empty testimony. Writes use a no-follow directory
+walk, an exclusive lock, a unique temporary file, atomic replacement, and an
+optional expected-card hash for compare-and-swap updates. `model:` remains a
+label supplied by the coordinator, not authenticated provenance.
 
 `--packets DIR` writes one comment-stripped packet per skeleton, with a
 manifest mapping packets to articles and hashes. The destination must be empty
@@ -386,17 +380,42 @@ the article packet and its passage; a read-back auditor is given one
 declaration's packet alone, since a read-back is testimony about one
 declaration.
 
-`autoform audit … --skeleton skeleton.json` compares both with the current
-report: `skeleton-drift` names an approval whose skeleton meaning has moved,
-`skeleton-evidence-drift` one whose recorded packet text has, and
-`readback-stale`, `readback-revised`, `readback-altered`, `readback-orphaned`,
-or `readback-missing` names testimony whose skeleton moved, whose packet text
-changed, whose displayed Lean was edited after filing, that describes a
-declaration the blueprint no longer names, or that was never filed. `autoform render … --skeleton skeleton.json` adds a
-*Review* disclosure under every statement box, showing the skeleton, the
-assumed library notions, the axioms, the read-back with its currency, and the
-approval state, so a reviewer compares book text, Lean, and testimony without
-leaving the page. Read-backs are never published as pages of their own.
+Prepare and check the complete review protocol through first-class commands:
+
+```bash
+autoform review prepare blueprint --lean-root . \
+  --output review.json --packets review-packets
+autoform review record blueprint --lean-root . --bundle review.json \
+  --article-id af_0123456789abcdef01234567 --declaration Ns.result \
+  --packet review-packets/blind/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.lean \
+  --testimony read-back.md --model muse-spark-1.1
+autoform review check blueprint --lean-root . --bundle review.json
+autoform audit blueprint --lean-root . --review-bundle review.json
+autoform render blueprint --lean-root . --review-bundle review.json
+```
+
+`review prepare` extracts Lean evidence from the current built tree and writes
+a strict, versioned bundle plus opaque packets. The bundle contains the exact
+article titles and statements, cited passages, declaration mapping, and packet bytes, but
+not the later testimony. A Lean-mapped article marked `origin: cited` must link
+to an in-vault, non-Markdown source snapshot with an exact
+`#L<start>-L<end>` range; preparation refuses a citation it cannot put before
+the reviewer. `review record` rechecks the selected current article
+and the exact packet bytes before filing a card; an unrelated article changing
+does not block that record. `review check`, `audit`, and `render` re-extract the
+current Lean evidence and reject unresolved, partial, foreign, or stale
+bundles. `review check` also requires complete current cards and matching human
+approvals. The rendered review disclosure uses the same packet bytes that were
+hashed, never a reconstructed or comment-bearing approximation. Read-back
+cards are absorbed into their article and are not published as standalone
+pages.
+
+Newly scaffolded projects commit the versioned `.autoform-review` policy marker,
+so generated CI enforces this gate from the first formalized statement. Older
+projects opt in by adding that marker; cards or `review_approved` assertions
+without it fail instead of silently disabling review. CI prepares a fresh
+temporary bundle after the Lean build and runs the review-only check, without
+turning advisory roadmap or coverage findings into merge blockers.
 
 Plan durable article identity metadata without changing the blueprint:
 

@@ -287,6 +287,11 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "autoform check blueprint --lean-root ." in workflow
     assert "autoform render blueprint" in workflow
     assert "--require-declarations" in workflow
+    assert "autoform review prepare blueprint --lean-root ." in workflow
+    assert "autoform review check blueprint --lean-root ." in workflow
+    assert "--review-bundle" in workflow
+    assert "--with markdown==3.10.3" in workflow
+    assert "--with pymdown-extensions==10.21.3" in workflow
     assert "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128" in workflow
     assert "@main" not in workflow
 
@@ -297,6 +302,8 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "Reject kernel-check bypass options" in verify
     assert "Audit every root-package declaration" in verify
     assert "python3 .github/autoform_audit.py" in verify
+    assert "autoform review prepare blueprint --lean-root ." in verify
+    assert "autoform review check blueprint --lean-root ." in verify
     assert "lake pack" in verify
     assert "lake-modules" not in verify
     assert "contains no ILean artifacts" in (
@@ -595,8 +602,11 @@ def test_review_skills_route_statement_review_through_the_cli_reference(repo_roo
 
     assert "../../autoform_cli/README.md#commands" in human
     assert "references/readback.md" in human
-    for flag in ("--packets", "--passages", "--skeleton"):
+    for flag in ("--packets", "--passages", "--review-bundle"):
         assert flag in reference, flag
-    assert "skeleton_approved" in reference and "readbacks/" in reference
+    assert "review_approved" in reference and "readbacks/" in reference
     assert "Prove2me" in readback
+    assert "Return only testimony" in readback
+    assert "review record" in readback
+    assert "saved skeleton report" in human
     assert (repo_root / "autoform_cli/probes/skeleton_probe.lean").is_file()

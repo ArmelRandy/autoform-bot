@@ -7,8 +7,8 @@ compares the read-back with the source statement; every gap between the two is
 exactly what they are looking for. The practice follows the read-back audits
 of the Prove2me platform.
 
-Read-backs live in the vault under ``blueprint/readbacks/<article id>/<Lean
-name>.md``. Each file is a self-contained review card: the exact skeleton the
+Read-backs live in the vault under ``blueprint/readbacks/<article_id>/<encoded
+Lean name>.md``. Each file is a self-contained review card: the exact skeleton the
 auditor was shown, in a Lean block, followed by the testimony under a
 ``## Read-back`` heading, so a reviewer working in the vault sees the Lean and
 its rendering side by side without the site. They are testimony, not derived
@@ -22,23 +22,37 @@ skeleton, rather than silently presenting stale evidence as current.
 
 from __future__ import annotations
 
+import hashlib
+import html
+import json
 import os
 import re
-from dataclasses import dataclass
+import secrets
+import stat
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Mapping
+from urllib.parse import unquote_to_bytes
 
-from .markdown import frontmatter_end
-from .skeleton import DeclarationSkeleton, SkeletonReport, evidence_hash_of
+import html5lib
+import markdown as markdown_renderer
+
+from .graph import ARTICLE_ID_PATTERN
+from .markdown import SITE_EXTENSION_CONFIGS, SITE_EXTENSIONS
+from .skeleton import DeclarationSkeleton, SkeletonReport, declaration_filename, evidence_hash_of
 
 READBACKS_DIR = "readbacks"
 READBACK_HEADING = "## Read-back"
+READBACK_SCHEMA = "autoform-readback/v1"
 SKELETON_HEADING = "## Skeleton"
+_FRONTMATTER_FIELDS = frozenset({"schema", "article_id", "declaration", "skeleton", "packet", "model"})
+_QUOTED_FRONTMATTER_FIELDS = frozenset({"article_id", "declaration", "model"})
 #: The only hash form a card may record: what `autoform skeleton` prints.
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
-#: The packet a card displays, between the skeleton heading and its fence.
-_SHOWN = re.compile(
-    r"^" + re.escape(SKELETON_HEADING) + r"\s*\n+```lean\n(?P<packet>.*?)\n```",
-    re.MULTILINE | re.DOTALL,
+_ALTERED_PACKET = "the displayed skeleton does not match the recorded packet hash"
+_UNSAFE_TEX_COMMAND = re.compile(
+    r"\\(?:require|href|style|class|cssId|htmlId|htmlClass|htmlStyle|url|csname|"
+    r"color|definecolor|textcolor|colorbox|fcolorbox)\b"
 )
 
 
@@ -46,7 +60,7 @@ _SHOWN = re.compile(
 class Readback:
     """One read-back file, parsed."""
 
-    node_id: str
+    article_id: str
     declaration: str
     skeleton_hash: str | None
     #: The evidence hash of the packet the auditor read, if the card records it.
@@ -58,6 +72,20 @@ class Readback:
     #: The evidence hash of the packet the card *shows*, which a reviewer reads
     #: beside the testimony. ``None`` when the card displays no packet.
     shown_hash: str | None = None
+    #: The exact packet text recovered from the fenced block, including its
+    #: terminal newline. This is the evidence the auditor actually saw.
+    shown_text: str | None = None
+    #: Hash of the complete on-disk card, used for compare-and-swap updates.
+    file_hash: str | None = None
+    #: Intrinsic format and identity failures. A malformed card is evidence for
+    #: nothing, even when one of its hashes happens to match a declaration.
+    validation_errors: tuple[str, ...] = ()
+
+    @property
+    def valid(self) -> bool:
+        """Whether the card is complete and internally self-consistent."""
+
+        return not self.validate()
 
     @property
     def shows_what_it_attests(self) -> bool:
@@ -68,27 +96,102 @@ class Readback:
         attesting to a packet nobody read.
         """
 
-        return self.shown_hash is None or self.shown_hash == self.packet_hash
+        return self.shown_hash is not None and self.packet_hash is not None and self.shown_hash == self.packet_hash
+
+    def validate(
+        self,
+        expected: DeclarationSkeleton | None = None,
+        *,
+        article_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Return intrinsic errors and, when given, mismatches with a declaration."""
+
+        errors = list(self.validation_errors)
+        if not isinstance(self.article_id, str) or ARTICLE_ID_PATTERN.fullmatch(self.article_id) is None:
+            errors.append("card has no valid article_id")
+        if not isinstance(self.declaration, str) or not self.declaration:
+            errors.append("card has no declaration")
+        else:
+            try:
+                declaration_filename(self.declaration, suffix=".md")
+            except ValueError:
+                errors.append("card has an invalid declaration")
+        if not isinstance(self.skeleton_hash, str) or _HASH.fullmatch(self.skeleton_hash) is None:
+            errors.append("card has no valid skeleton hash")
+        if not isinstance(self.packet_hash, str) or _HASH.fullmatch(self.packet_hash) is None:
+            errors.append("card has no valid packet hash")
+        if not isinstance(self.model, str) or not _safe_model_label(self.model):
+            errors.append("card has no valid model label")
+        if not isinstance(self.text, str) or not self.text.strip():
+            errors.append("card has no nonempty testimony")
+        elif testimony_errors := _testimony_errors(self.text):
+            errors.extend(testimony_errors)
+        if not isinstance(self.shown_text, str):
+            errors.append("card has no exact displayed packet")
+        else:
+            calculated_shown_hash = evidence_hash_of(self.shown_text)
+            if self.shown_hash != calculated_shown_hash:
+                errors.append("displayed packet hash does not match its bytes")
+            if self.packet_hash != calculated_shown_hash:
+                errors.append(_ALTERED_PACKET)
+        if not isinstance(self.file_hash, str) or _HASH.fullmatch(self.file_hash) is None:
+            errors.append("card has no valid whole-file hash")
+        elif all(
+            isinstance(value, str)
+            for value in (
+                self.article_id,
+                self.declaration,
+                self.skeleton_hash,
+                self.packet_hash,
+                self.model,
+                self.shown_text,
+                self.text,
+            )
+        ):
+            canonical = _card_content(
+                article_id=self.article_id,
+                declaration=self.declaration,
+                skeleton_hash=self.skeleton_hash or "",
+                packet_hash=self.packet_hash or "",
+                model=self.model or "",
+                packet_text=self.shown_text or "",
+                testimony=self.text,
+            )
+            if self.file_hash != evidence_hash_of(canonical):
+                errors.append("whole-file hash does not match the canonical card bytes")
+        if article_id is not None and self.article_id != article_id:
+            errors.append(f"card article_id is {self.article_id!r}, expected {article_id!r}")
+        if expected is not None:
+            if self.declaration != expected.name:
+                errors.append(f"card identity is {self.declaration!r}, expected {expected.name!r}")
+            if self.skeleton_hash != expected.hash:
+                errors.append(f"skeleton hash is {self.skeleton_hash!r}, expected {expected.hash}")
+            if self.packet_hash != expected.evidence_hash:
+                errors.append(f"packet hash is {self.packet_hash!r}, expected {expected.evidence_hash}")
+        return tuple(dict.fromkeys(errors))
 
     def status(self, skeleton: DeclarationSkeleton) -> str:
         """``current``, ``revised`` (same meaning, packet text changed), or ``stale``."""
 
+        if not self.valid:
+            return "invalid"
         if self.skeleton_hash != skeleton.hash:
             return "stale"
-        if self.packet_hash is not None and self.packet_hash != skeleton.evidence_hash:
+        if self.packet_hash != skeleton.evidence_hash:
             return "revised"
         return "current"
 
 
-def readback_path(blueprint: Path, node_id: str, declaration: str) -> Path:
+def readback_path(blueprint: Path, article_id: str, declaration: str) -> Path:
     """The card's place in the vault; refuses names that would leave the readbacks tree."""
 
-    parts = node_id.split("/")
-    if not node_id or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError(f"invalid article id for a read-back: {node_id!r}")
-    if not declaration or "/" in declaration or "\\" in declaration or declaration in {".", ".."}:
-        raise ValueError(f"invalid declaration name for a read-back: {declaration!r}")
-    return blueprint / READBACKS_DIR / Path(*parts) / f"{declaration}.md"
+    if not ARTICLE_ID_PATTERN.fullmatch(article_id):
+        raise ValueError(f"invalid article_id for a read-back: {article_id!r}")
+    try:
+        filename = declaration_filename(declaration, suffix=".md")
+    except ValueError as exc:
+        raise ValueError(f"invalid read-back declaration: {declaration!r}") from exc
+    return blueprint / READBACKS_DIR / article_id / filename
 
 
 def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
@@ -96,7 +199,7 @@ def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
 
     root = Path(blueprint).expanduser().resolve() / READBACKS_DIR
     found: dict[tuple[str, str], Readback] = {}
-    if not root.is_dir():
+    if root.is_symlink() or not root.is_dir():
         return found
     for path in sorted(root.rglob("*.md")):
         # A card is a file inside the vault; a symlink could point anywhere.
@@ -105,70 +208,171 @@ def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
         if any((root / parent).is_symlink() for parent in path.relative_to(root).parents):
             continue
         relative = path.relative_to(root)
-        node_id = relative.parent.as_posix()
+        path_article_id = relative.parent.name if len(relative.parts) == 2 else None
         declaration = relative.stem
         try:
-            text = path.read_text(encoding="utf-8")
+            raw = path.read_bytes()
+            text = raw.decode("utf-8")
         except (OSError, UnicodeError):
             continue
-        metadata, body = _split(text)
-        shown = _SHOWN.search(body)
-        found[(node_id, declaration)] = Readback(
-            node_id=node_id,
-            declaration=metadata.get("declaration") or declaration,
-            skeleton_hash=_hash_or_none(metadata.get("skeleton")),
-            packet_hash=_hash_or_none(metadata.get("packet")),
-            model=metadata.get("model"),
-            text=_testimony(body),
-            path=path,
-            shown_hash=evidence_hash_of(shown.group("packet") + "\n") if shown else None,
+        metadata, body, frontmatter_errors = _split(text)
+        recorded_article_id = metadata.get("article_id")
+        recorded_declaration = metadata.get("declaration")
+        filename_declaration = _declaration_from_filename(relative.name)
+        declaration = filename_declaration or recorded_declaration or relative.stem
+        errors = list(frontmatter_errors)
+        article_id = path_article_id or recorded_article_id or relative.parent.as_posix()
+        if recorded_article_id is not None and not ARTICLE_ID_PATTERN.fullmatch(recorded_article_id):
+            errors.append(f"card records an invalid article_id: {recorded_article_id!r}")
+        if path_article_id is None or not ARTICLE_ID_PATTERN.fullmatch(path_article_id):
+            errors.append("card path does not use one valid article_id directory")
+        if recorded_article_id and path_article_id and recorded_article_id != path_article_id:
+            errors.append(
+                f"frontmatter article_id {recorded_article_id!r} does not match "
+                f"the card path article_id {path_article_id!r}"
+            )
+        if not recorded_declaration:
+            errors.append("card records no declaration")
+        else:
+            try:
+                expected = readback_path(root.parent, recorded_article_id or "", recorded_declaration)
+            except ValueError:
+                errors.append(f"card records an invalid declaration: {recorded_declaration!r}")
+            else:
+                if expected != path:
+                    errors.append(
+                        f"frontmatter declaration {recorded_declaration!r} does not match "
+                        f"the card path {relative.as_posix()!r}"
+                    )
+        raw_skeleton_hash = metadata.get("skeleton")
+        skeleton_hash = _hash_or_none(raw_skeleton_hash)
+        if skeleton_hash is None:
+            qualifier = "no" if raw_skeleton_hash is None else "a malformed"
+            errors.append(f"card records {qualifier} skeleton hash")
+        raw_packet_hash = metadata.get("packet")
+        packet_hash = _hash_or_none(raw_packet_hash)
+        if packet_hash is None:
+            qualifier = "no" if raw_packet_hash is None else "a malformed"
+            errors.append(f"card records {qualifier} packet hash")
+        model = metadata.get("model")
+        if model is None or not model.strip():
+            errors.append("card records no nonempty model label")
+        shown_text, testimony, body_errors = _card_body(
+            body,
+            article_id=recorded_article_id,
+            declaration=recorded_declaration,
+            skeleton_hash=skeleton_hash,
+            model=model,
         )
+        errors.extend(body_errors)
+        errors.extend(_testimony_errors(testimony))
+        shown_hash = evidence_hash_of(shown_text) if shown_text is not None else None
+        if shown_hash is not None and packet_hash is not None and shown_hash != packet_hash:
+            errors.append(_ALTERED_PACKET)
+        if all(
+            value is not None
+            for value in (
+                recorded_article_id,
+                recorded_declaration,
+                skeleton_hash,
+                packet_hash,
+                model,
+                shown_text,
+            )
+        ):
+            canonical = _card_content(
+                article_id=recorded_article_id or "",
+                declaration=recorded_declaration or "",
+                skeleton_hash=skeleton_hash or "",
+                packet_hash=packet_hash or "",
+                model=model or "",
+                packet_text=shown_text or "",
+                testimony=testimony,
+            )
+            if canonical != text:
+                errors.append("card is not in canonical autoform-readback/v1 form")
+        readback = Readback(
+            article_id=article_id,
+            declaration=declaration,
+            skeleton_hash=skeleton_hash,
+            packet_hash=packet_hash,
+            model=model,
+            text=testimony,
+            path=path,
+            shown_hash=shown_hash,
+            shown_text=shown_text,
+            file_hash="sha256:" + hashlib.sha256(raw).hexdigest(),
+            validation_errors=tuple(errors),
+        )
+        key = (article_id, declaration)
+        if previous := found.get(key):
+            duplicate = f"multiple cards claim the same declaration identity: {previous.path} and {path}"
+            found[key] = replace(
+                previous,
+                validation_errors=tuple(dict.fromkeys((*previous.validation_errors, duplicate))),
+            )
+        else:
+            found[key] = readback
     return found
 
 
 def write_readback(
     blueprint: str | Path,
     *,
-    node_id: str,
+    article_id: str,
     declaration: DeclarationSkeleton,
     model: str,
     text: str,
+    packet_text: str,
+    expected_card_hash: str | None = None,
 ) -> Path:
-    """File a read-back for ``declaration`` under the article it belongs to."""
+    """File a complete card without following links or clobbering another writer.
 
-    path = readback_path(Path(blueprint).expanduser().resolve(), node_id, declaration.name)
-    if path.is_symlink():
-        raise ValueError(f"refusing to write a read-back through a symlink: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = "\n".join(
-        [
-            "---",
-            f"declaration: {declaration.name}",
-            f"skeleton: {declaration.hash}",
-            f"packet: {declaration.evidence_hash}",
-            f"model: {model}",
-            "---",
-            "",
-            f"# {declaration.name}",
-            "",
-            f"Article `{node_id}` · {declaration.kind} · skeleton `{declaration.hash[:12]}…` · read back by {model}.",
-            "",
-            "## Skeleton",
-            "",
-            "```lean",
-            declaration.blind_text().rstrip("\n"),
-            "```",
-            "",
-            READBACK_HEADING,
-            "",
-            text.strip("\n"),
-            "",
-        ]
+    ``packet_text`` is required because the card attests to what the independent
+    reader actually received, not to a packet reconstructed later. A differing
+    packet is rejected even if a caller supplies matching metadata.
+
+    Existing different content is replaced only when ``expected_card_hash``
+    names it. This compare-and-swap rule prevents asynchronous reviewers from
+    silently overwriting one another. Filing identical content is idempotent.
+    """
+
+    blueprint_path = Path(blueprint).expanduser().resolve()
+    path = readback_path(blueprint_path, article_id, declaration.name)
+    if not model.strip():
+        raise ValueError("a read-back requires a nonempty model label")
+    if not _safe_model_label(model):
+        raise ValueError("a read-back model label must be printable, single-line text")
+    if not text.strip():
+        raise ValueError("a read-back requires nonempty testimony")
+    testimony_errors = _testimony_errors(text)
+    if testimony_errors:
+        raise ValueError("unsafe read-back testimony: " + "; ".join(testimony_errors))
+    expected_packet = declaration.blind_text()
+    if packet_text != expected_packet or evidence_hash_of(packet_text) != declaration.evidence_hash:
+        raise ValueError(f"read-back packet does not match the current packet for {declaration.name}")
+    if expected_card_hash is not None and _hash_or_none(expected_card_hash) is None:
+        raise ValueError(f"invalid expected card hash: {expected_card_hash!r}")
+
+    content = _card_content(
+        article_id=article_id,
+        declaration=declaration.name,
+        skeleton_hash=declaration.hash,
+        packet_hash=declaration.evidence_hash,
+        model=model,
+        packet_text=packet_text,
+        testimony=text,
     )
-    # Write whole or not at all: a reviewer never sees a half-written card.
-    staged = path.with_name(path.name + ".tmp")
-    staged.write_text(content, encoding="utf-8")
-    os.replace(staged, path)
+    parent_descriptor = _open_card_parent(blueprint_path, article_id)
+    try:
+        _publish_card(
+            parent_descriptor,
+            path,
+            content,
+            expected_card_hash=expected_card_hash,
+        )
+    finally:
+        os.close(parent_descriptor)
     return path
 
 
@@ -185,13 +389,21 @@ class ReadbackFinding:
 def readback_findings(
     report: SkeletonReport,
     readbacks: dict[tuple[str, str], Readback],
+    *,
+    article_ids: Mapping[str, str] | None = None,
 ) -> list[ReadbackFinding]:
-    """Compare every skeleton with the testimony filed for it."""
+    """Compare every skeleton with testimony keyed by durable article id.
+
+    ``article_ids`` maps each report node id to the corresponding graph
+    ``article_id``. It is required when those identities differ.
+    """
 
     findings: list[ReadbackFinding] = []
+    identities = article_ids or {}
     for node in report.nodes:
+        article_id = identities.get(node.node_id, node.node_id)
         for declaration in node.declarations:
-            readback = readbacks.get((node.node_id, declaration.name))
+            readback = readbacks.get((article_id, declaration.name))
             if readback is None:
                 findings.append(
                     ReadbackFinding(
@@ -199,6 +411,19 @@ def readback_findings(
                         declaration.name,
                         "readback-missing",
                         f"no read-back filed for {declaration.name}; write one from its blind packet",
+                    )
+                )
+            elif validation_errors := readback.validate():
+                code = "readback-altered" if validation_errors == (_ALTERED_PACKET,) else "readback-invalid"
+                detail = "; ".join(validation_errors)
+                if code == "readback-altered":
+                    detail += f" (records {readback.packet_hash}, shows {readback.shown_hash})"
+                findings.append(
+                    ReadbackFinding(
+                        node.node_id,
+                        declaration.name,
+                        code,
+                        f"read-back for {declaration.name} is not valid: {detail}",
                     )
                 )
             elif readback.status(declaration) == "stale":
@@ -216,16 +441,6 @@ def readback_findings(
                         ),
                     )
                 )
-            elif not readback.shows_what_it_attests:
-                findings.append(
-                    ReadbackFinding(
-                        node.node_id,
-                        declaration.name,
-                        "readback-altered",
-                        f"read-back for {declaration.name} shows a packet that is not the one it "
-                        f"records ({readback.packet_hash}); the card was edited after it was filed",
-                    )
-                )
             elif readback.status(declaration) == "revised":
                 findings.append(
                     ReadbackFinding(
@@ -238,14 +453,18 @@ def readback_findings(
                 )
     # Testimony about a declaration the blueprint no longer names is evidence
     # for nothing, and would otherwise sit in the vault unmentioned forever.
-    named = {(node.node_id, declaration.name) for node in report.nodes for declaration in node.declarations}
-    for node_id, name in sorted(set(readbacks) - named):
+    named = {
+        (identities.get(node.node_id, node.node_id), declaration.name)
+        for node in report.nodes
+        for declaration in node.declarations
+    }
+    for article_id, name in sorted(set(readbacks) - named):
         findings.append(
             ReadbackFinding(
-                node_id,
+                article_id,
                 name,
                 "readback-orphaned",
-                f"read-back filed for {name} under {node_id}, which names no such declaration; "
+                f"read-back filed for {name} under article_id {article_id}, which names no such declaration; "
                 "the statement was renamed or removed, so delete the card or restore the name",
             )
         )
@@ -258,32 +477,435 @@ def _hash_or_none(value: str | None) -> str | None:
     return value if value is not None and _HASH.fullmatch(value) else None
 
 
-def _testimony(body: str) -> str:
-    """Return the text under ``## Read-back``, or the whole body of an older file."""
+def _safe_model_label(value: str) -> bool:
+    return (
+        bool(value)
+        and value == value.strip()
+        and len(value) <= 200
+        and all(character.isprintable() for character in value)
+    )
 
-    lines = body.splitlines()
-    for index, line in enumerate(lines):
-        if line.strip().casefold() == READBACK_HEADING.casefold():
-            return "\n".join(lines[index + 1 :]).strip("\n")
-    return body.strip("\n")
+
+def _testimony_errors(text: str) -> tuple[str, ...]:
+    """Reject Markdown constructs that can emit active or remote HTML.
+
+    Read-backs need prose, lists, emphasis, code, and mathematical notation.
+    They do not need links or embedded content. Parsing with the same relevant
+    Markdown extensions catches reference links and attribute-list handlers
+    that lexical URL filtering misses.
+    """
+
+    parser = markdown_renderer.Markdown(
+        extensions=list(SITE_EXTENSIONS),
+        extension_configs=SITE_EXTENSION_CONFIGS,
+    )
+    rendered = parser.convert(text)
+    errors: list[str] = []
+    if parser.htmlStash.rawHtmlBlocks:
+        errors.append("raw HTML is not allowed")
+    if parser.references:
+        errors.append("Markdown link definitions are not allowed")
+    document = html5lib.parseFragment(rendered, namespaceHTMLElements=False)
+    for element in document.iter():
+        tag = str(element.tag).lower()
+        attributes = {str(name).lower() for name in element.attrib}
+        classes = set(str(element.attrib.get("class", "")).split())
+        if tag in {"a", "img"}:
+            errors.append("Markdown links, images, and autolinks are not allowed")
+        if tag == "script":
+            if not element.attrib.get("type", "").startswith("math/tex"):
+                errors.append("active HTML is not allowed")
+            else:
+                tex = re.sub(r"(?<!\\)%[^\n]*(?:\n|$)", "", element.text or "")
+                if _UNSAFE_TEX_COMMAND.search(tex):
+                    errors.append("active TeX commands are not allowed")
+        if "arithmatex" in classes:
+            tex = re.sub(r"(?<!\\)%[^\n]*(?:\n|$)", "", element.text or "")
+            if _UNSAFE_TEX_COMMAND.search(tex):
+                errors.append("active TeX commands are not allowed")
+        if "style" in attributes or any(name.startswith("on") for name in attributes):
+            errors.append("active Markdown attributes are not allowed")
+        if "hidden" in attributes or "aria-hidden" in attributes:
+            errors.append("visibility-changing Markdown attributes are not allowed")
+        if "mermaid" in classes:
+            errors.append("active Mermaid blocks are not allowed")
+        if attributes and not _renderer_owned_attributes(tag, element.attrib):
+            errors.append("user-supplied Markdown attributes are not allowed")
+    if re.search(r"^ {0,3}(?:`{3,}|~{3,})[ \t]*mermaid(?:[ \t]|$)", text, re.MULTILINE | re.IGNORECASE):
+        errors.append("active Mermaid blocks are not allowed")
+    return tuple(dict.fromkeys(errors))
 
 
-def _split(text: str) -> tuple[dict[str, str], str]:
+def _renderer_owned_attributes(tag: str, attributes: Mapping[str, str]) -> bool:
+    """Allow only attributes emitted by the configured Markdown renderer."""
+
+    normalized = {str(name).lower(): str(value) for name, value in attributes.items()}
+    if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+        return set(normalized) == {"id"}
+    if tag == "script":
+        return set(normalized) == {"type"} and normalized["type"].startswith("math/tex")
+    classes = set(normalized.get("class", "").split())
+    if set(normalized) != {"class"}:
+        return False
+    if tag in {"span", "div"} and classes in ({"arithmatex"}, {"MathJax_Preview"}):
+        return True
+    if tag == "div" and classes in ({"highlight"}, {"linenodiv"}):
+        return True
+    if tag == "table" and classes == {"highlighttable"}:
+        return True
+    if tag == "td" and classes in ({"linenos"}, {"code"}):
+        return True
+    if tag == "span" and len(classes) == 1:
+        token = next(iter(classes))
+        return token in {"hll", "normal"} or re.fullmatch(r"[a-z][a-z0-9]{0,3}", token) is not None
+    return False
+
+
+def _card_body(
+    body: str,
+    *,
+    article_id: str | None,
+    declaration: str | None,
+    skeleton_hash: str | None,
+    model: str | None,
+) -> tuple[str | None, str, tuple[str, ...]]:
+    """Recover one exact packet and the testimony from the canonical card body."""
+
+    if None in {article_id, declaration, skeleton_hash, model}:
+        return None, "", ("card metadata is incomplete, so its body cannot be validated",)
+    preamble = _card_preamble(
+        article_id=article_id or "",
+        declaration=declaration or "",
+        skeleton_hash=skeleton_hash or "",
+        model=model or "",
+    )
+    if not body.startswith(preamble):
+        return None, "", ("card must contain exactly one skeleton block in the canonical preamble",)
+    remainder = body[len(preamble) :]
+    opening = re.match(r"(?P<fence>`{3,})lean\n", remainder)
+    if opening is None:
+        return None, "", ("card must contain one canonical skeleton block",)
+    fence = opening.group("fence")
+    packet_and_testimony = remainder[opening.end() :]
+    closing_marker = f"{fence}\n"
+    closing = packet_and_testimony.find(closing_marker)
+    if closing < 0:
+        return None, "", ("card must contain exactly one skeleton block",)
+    shown_text = packet_and_testimony[:closing]
+    after_packet = packet_and_testimony[closing + len(closing_marker) :]
+    heading = f"\n{READBACK_HEADING}\n"
+    if after_packet == f"\n{READBACK_HEADING}":
+        return shown_text, "", ("card contains no nonempty read-back testimony",)
+    if not after_packet.startswith(heading):
+        return shown_text, "", ("card must put the read-back heading immediately after the skeleton block",)
+    after_heading = after_packet[len(heading) :]
+    testimony = after_heading[1:] if after_heading.startswith("\n") else after_heading
+    errors: list[str] = []
+    if not after_heading.startswith("\n"):
+        errors.append("card must put one blank line after the read-back heading")
+    expected_fence = "`" * max(3, _longest_backtick_run(shown_text) + 1)
+    if fence != expected_fence:
+        errors.append("card skeleton fence is not canonical for its packet")
+    if not shown_text.endswith("\n"):
+        errors.append("card skeleton packet must end with a newline")
+    if not testimony.strip():
+        errors.append("card contains no nonempty read-back testimony")
+    return shown_text, testimony, tuple(errors)
+
+
+def _card_preamble(
+    *,
+    article_id: str,
+    declaration: str,
+    skeleton_hash: str,
+    model: str,
+) -> str:
+    return "".join(
+        [
+            "\n# Read-back\n\n",
+            f"Article <code>{html.escape(article_id)}</code> · "
+            f"declaration <code>{html.escape(declaration)}</code> · "
+            f"skeleton <code>{html.escape(skeleton_hash[:12])}…</code> · "
+            f"read back by <code>{html.escape(model)}</code>.\n\n",
+            f"{SKELETON_HEADING}\n\n",
+        ]
+    )
+
+
+def _card_content(
+    *,
+    article_id: str,
+    declaration: str,
+    skeleton_hash: str,
+    packet_hash: str,
+    model: str,
+    packet_text: str,
+    testimony: str,
+) -> str:
+    fence = "`" * max(3, _longest_backtick_run(packet_text) + 1)
+    return "".join(
+        [
+            "---\n",
+            f"schema: {READBACK_SCHEMA}\n",
+            f"article_id: {json.dumps(article_id, ensure_ascii=False)}\n",
+            f"declaration: {json.dumps(declaration, ensure_ascii=False)}\n",
+            f"skeleton: {skeleton_hash}\n",
+            f"packet: {packet_hash}\n",
+            f"model: {json.dumps(model, ensure_ascii=False)}\n",
+            "---\n",
+            _card_preamble(
+                article_id=article_id,
+                declaration=declaration,
+                skeleton_hash=skeleton_hash,
+                model=model,
+            ),
+            f"{fence}lean\n",
+            packet_text,
+            f"{fence}\n\n",
+            f"{READBACK_HEADING}\n\n",
+            testimony.strip("\n"),
+            "\n",
+        ]
+    )
+
+
+def _declaration_from_filename(filename: str) -> str | None:
+    """Decode a short canonical card filename; long names rely on metadata."""
+
+    if not filename.endswith(".md"):
+        return None
+    encoded, separator, digest = filename[:-3].rpartition("--")
+    if not separator or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return None
+    try:
+        declaration = unquote_to_bytes(encoded).decode("utf-8")
+    except UnicodeError:
+        return None
+    return declaration if declaration_filename(declaration, suffix=".md") == filename else None
+
+
+def _open_card_parent(blueprint: Path, article_id: str) -> int:
+    """Open the card directory through held, no-follow directory descriptors."""
+
+    required = (
+        hasattr(os, "O_DIRECTORY"),
+        hasattr(os, "O_NOFOLLOW"),
+        os.open in os.supports_dir_fd,
+        os.mkdir in os.supports_dir_fd,
+        os.rename in os.supports_dir_fd,
+        os.stat in os.supports_dir_fd,
+        os.unlink in os.supports_dir_fd,
+    )
+    if not all(required):
+        raise ValueError("this platform cannot safely publish read-back cards")
+    if not ARTICLE_ID_PATTERN.fullmatch(article_id):
+        raise ValueError(f"invalid article_id for a read-back: {article_id!r}")
+    relative = Path(READBACKS_DIR) / article_id
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        current = os.open(blueprint, flags)
+    except OSError as exc:
+        raise ValueError(f"cannot safely open blueprint directory: {blueprint}") from exc
+    try:
+        for part in relative.parts:
+            try:
+                following = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=current)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise ValueError(f"cannot create read-back directory component: {part}") from exc
+                try:
+                    following = os.open(part, flags, dir_fd=current)
+                except OSError as exc:
+                    raise ValueError(
+                        f"refusing a symlink or unsafe component in the read-back path: {part}"
+                    ) from exc
+            except OSError as exc:
+                raise ValueError(
+                    f"refusing a symlink or unsafe component in the read-back path: {part}"
+                ) from exc
+            os.close(current)
+            current = following
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _card_hash_at(directory: int, filename: str, display_path: Path) -> str | None:
+    """Read a card relative to a held directory without following links."""
+
+    try:
+        descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"cannot safely inspect existing read-back: {display_path}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"read-back destination is not a regular file: {display_path}")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            try:
+                text = stream.read().decode("utf-8")
+            except UnicodeError as exc:
+                raise ValueError(f"existing read-back is not UTF-8: {display_path}") from exc
+        return evidence_hash_of(text)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _publish_card(
+    directory: int,
+    path: Path,
+    content: str,
+    *,
+    expected_card_hash: str | None,
+) -> None:
+    """Atomically publish content through a held directory descriptor and CAS."""
+
+    filename = path.name
+    lock_digest = evidence_hash_of(filename).removeprefix("sha256:")[:32]
+    lock_name = f".autoform-readback-{lock_digest}.lock"
+    lock_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        lock_descriptor = os.open(lock_name, lock_flags, 0o600, dir_fd=directory)
+    except FileExistsError as exc:
+        raise ValueError(f"another writer is filing this read-back: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"cannot lock read-back for writing: {path}") from exc
+
+    lock_stat = os.fstat(lock_descriptor)
+    lock_identity = lock_stat.st_dev, lock_stat.st_ino
+    temporary_name: str | None = None
+    try:
+        os.close(lock_descriptor)
+        before = _card_hash_at(directory, filename, path)
+        replacement_hash = evidence_hash_of(content)
+        if before == replacement_hash:
+            return
+        if before is not None and expected_card_hash is None:
+            raise ValueError(
+                f"read-back already exists with different content: {path}; retry with expected_card_hash={before!r}"
+            )
+        if before != expected_card_hash:
+            raise ValueError(
+                f"read-back changed before replacement: expected {expected_card_hash!r}, found {before!r}"
+            )
+        for _ in range(100):
+            temporary_name = f".autoform-readback-{secrets.token_hex(12)}.tmp"
+            try:
+                descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory,
+                )
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise ValueError(f"cannot allocate a unique staging file for read-back: {path}")
+        staged_stat = os.fstat(descriptor)
+        staged_identity = staged_stat.st_dev, staged_stat.st_ino
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_name, 0o644, dir_fd=directory, follow_symlinks=False)
+        staged = os.stat(temporary_name, dir_fd=directory, follow_symlinks=False)
+        if (staged.st_dev, staged.st_ino) != staged_identity or stat.S_ISLNK(staged.st_mode):
+            raise ValueError(f"read-back staging file changed before publication: {path}")
+        if _card_hash_at(directory, filename, path) != before:
+            raise ValueError(f"read-back changed concurrently while writing: {path}")
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        temporary_name = None
+        try:
+            os.fsync(directory)
+        except OSError:
+            pass
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+        try:
+            current_lock = os.stat(lock_name, dir_fd=directory, follow_symlinks=False)
+            if (current_lock.st_dev, current_lock.st_ino) == lock_identity:
+                os.unlink(lock_name, dir_fd=directory)
+        except OSError:
+            pass
+
+
+def _longest_backtick_run(text: str) -> int:
+    runs = re.findall(r"`+", text)
+    return max((len(run) for run in runs), default=0)
+
+
+def _split(text: str) -> tuple[dict[str, str], str, tuple[str, ...]]:
+    """Parse the deliberately small, versioned read-back frontmatter schema."""
+
     lines = text.splitlines()
-    end = frontmatter_end(lines)
     metadata: dict[str, str] = {}
-    if end:
-        for raw in lines[1 : end - 1]:
-            if ":" in raw:
-                key, value = (part.strip() for part in raw.split(":", 1))
-                if key and value:
-                    metadata[key] = value
-    return metadata, "\n".join(lines[end:])
+    seen: set[str] = set()
+    errors: list[str] = []
+    if not lines or lines[0].strip() != "---":
+        return metadata, text, ("card has no frontmatter block",)
+    closing = next((index for index, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+    if closing is None:
+        return metadata, "", ("card has no closing frontmatter delimiter",)
+    for line_number, raw in enumerate(lines[1:closing], 2):
+        if not raw.strip():
+            continue
+        if ":" not in raw:
+            errors.append(f"frontmatter line {line_number} is malformed")
+            continue
+        key, value = (part.strip() for part in raw.split(":", 1))
+        if not key:
+            errors.append(f"frontmatter line {line_number} has no key")
+            continue
+        if key in seen:
+            errors.append(f"frontmatter field {key!r} appears more than once")
+            continue
+        seen.add(key)
+        if key not in _FRONTMATTER_FIELDS:
+            errors.append(f"unknown frontmatter field {key!r}")
+        if key in _QUOTED_FRONTMATTER_FIELDS:
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                errors.append(f"frontmatter field {key!r} must be a JSON double-quoted string")
+                continue
+            if not isinstance(decoded, str):
+                errors.append(f"frontmatter field {key!r} must decode to a string")
+                continue
+            if key == "model" and not _safe_model_label(decoded):
+                errors.append("frontmatter field 'model' must be printable, single-line text")
+            metadata[key] = decoded
+        else:
+            metadata[key] = value
+    for field in sorted(_FRONTMATTER_FIELDS - metadata.keys()):
+        errors.append(f"missing frontmatter field {field!r}")
+    schema = metadata.get("schema")
+    if schema is not None and schema != READBACK_SCHEMA:
+        errors.append(f"unsupported read-back schema {schema!r}; expected {READBACK_SCHEMA!r}")
+    return metadata, "\n".join(lines[closing + 1 :]), tuple(errors)
 
 
 __all__ = [
     "READBACKS_DIR",
     "READBACK_HEADING",
+    "READBACK_SCHEMA",
     "Readback",
     "ReadbackFinding",
     "load_readbacks",

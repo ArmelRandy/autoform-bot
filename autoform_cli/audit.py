@@ -17,13 +17,12 @@ from . import status
 from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import SourceIndex, declaration_names, index_project
-from .markdown import FENCE as _FENCE
+from .markdown import content_lines as _content_lines
 from .markdown import frontmatter_end as _frontmatter_end
 from .markdown import HEADING as _HEADING
-from .markdown import HTML_COMMENT as _HTML_COMMENT
 from .markdown import local_target_issue as _local_target_issue
 from .markdown import markdown_links as _markdown_links
-from .readback import load_readbacks, readback_findings
+from .review import ReviewBundle, review_findings
 from .skeleton import SkeletonReport
 
 #: More siblings than this at one level is a table of contents, not a chapter.
@@ -96,6 +95,7 @@ def audit_blueprint(
     *,
     lean_root: str | Path | None = None,
     skeleton: SkeletonReport | None = None,
+    review_bundle: ReviewBundle | None = None,
 ) -> AuditResult:
     """Audit *blueprint_dir* using only local, committed-style source files.
 
@@ -126,6 +126,7 @@ def audit_blueprint(
         coverage=coverage,
         coverage_findings=coverage_findings,
         skeleton=skeleton,
+        review_bundle=review_bundle,
     )
 
 
@@ -136,6 +137,7 @@ def audit_graph(
     coverage: CoverageSummary | None = None,
     coverage_findings: list[AuditFinding] | None = None,
     skeleton: SkeletonReport | None = None,
+    review_bundle: ReviewBundle | None = None,
 ) -> AuditResult:
     """Audit an already loaded graph without modifying it or its source files."""
 
@@ -235,55 +237,49 @@ def audit_graph(
     findings.extend(coverage_findings)
     if lean_root is not None:
         findings.extend(_lean_findings(graph, lean_root))
-    if skeleton is not None:
-        findings.extend(_review_findings(graph, skeleton))
+    findings.extend(_review_findings(graph, review_bundle, skeleton))
     return _result(findings, coverage=coverage)
 
 
-def _review_findings(graph: Graph, skeleton: SkeletonReport) -> list[AuditFinding]:
-    """Compare approvals and read-backs with the skeletons they testify about.
+def _review_findings(
+    graph: Graph,
+    bundle: ReviewBundle | None,
+    current_skeleton: SkeletonReport | None,
+) -> list[AuditFinding]:
+    """Fail closed when recorded approval lacks fully current review evidence."""
 
-    An approval names a hash. When the skeleton behind it has moved, the human
-    has not approved what is there now, and that is reported as drift rather
-    than left to stand. A read-back is held to the same standard, and a
-    formalized statement without one has no testimony a reviewer can compare.
-    """
-
+    approved = [node for node in graph.nodes.values() if node.review_approved is not None]
+    if bundle is None:
+        return [
+            AuditFinding(
+                _relative_path(node.path, graph.blueprint_dir),
+                "review-bundle-missing",
+                "review_approved is present but no prepared review bundle was supplied",
+            )
+            for node in approved
+        ]
+    if current_skeleton is None:
+        target_ids = {
+            *(node.id for node in approved),
+            *(node.id for node in graph.nodes.values() if node.lean),
+            *(article.node_id for article in bundle.articles),
+        }
+        if not target_ids:
+            target_ids.add("")
+        findings = []
+        for node_id in sorted(target_ids):
+            node = graph.nodes.get(node_id)
+            article_path = _relative_path(node.path, graph.blueprint_dir) if node is not None else node_id
+            findings.append(
+                AuditFinding(
+                    article_path,
+                    "review-bundle-unverified",
+                    "a review bundle was supplied without a freshly extracted current skeleton",
+                )
+            )
+        return findings
     findings: list[AuditFinding] = []
-    for node_id in sorted(graph.nodes):
-        node = graph.nodes[node_id]
-        article_path = _relative_path(node.path, graph.blueprint_dir)
-        record = skeleton.node(node_id)
-        if node.skeleton_approved is None:
-            continue
-        if record is None or not record.declarations:
-            findings.append(
-                AuditFinding(
-                    article_path,
-                    "skeleton-drift",
-                    f"skeleton_approved is {node.skeleton_approved} but no skeleton could be extracted for this article",
-                )
-            )
-        elif record.hash != node.skeleton_approved:
-            findings.append(
-                AuditFinding(
-                    article_path,
-                    "skeleton-drift",
-                    f"skeleton_approved is {node.skeleton_approved} but the current skeleton is {record.hash}; "
-                    "re-review the statement and update or remove the approval",
-                )
-            )
-        elif node.skeleton_evidence is not None and node.skeleton_evidence != record.evidence_hash:
-            findings.append(
-                AuditFinding(
-                    article_path,
-                    "skeleton-evidence-drift",
-                    f"skeleton_evidence is {node.skeleton_evidence} but the packet text is now "
-                    f"{record.evidence_hash}; the meaning is unchanged, re-read the packet and update the key",
-                )
-            )
-    readbacks = load_readbacks(graph.blueprint_dir)
-    for finding in readback_findings(skeleton, readbacks):
+    for finding in review_findings(graph, bundle, current_skeleton):
         node = graph.nodes.get(finding.node_id)
         article_path = _relative_path(node.path, graph.blueprint_dir) if node else finding.node_id
         findings.append(AuditFinding(article_path, finding.code, finding.reason))
@@ -304,25 +300,12 @@ def _read_article(path: Path) -> _ArticleShape:
 
     lines = text.splitlines()
     start = _frontmatter_end(lines)
-    body = _HTML_COMMENT.sub("", "\n".join(lines[start:]))
+    body = "\n".join(lines[start:])
     seen_h1 = False
     before_first_h2 = True
     statement_text = False
     has_depends_section = False
-    fence: tuple[str, int] | None = None
-
-    for line in body.splitlines():
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-
+    for line in _content_lines(body):
         heading = _HEADING.match(line)
         if heading:
             level = len(heading.group(1))

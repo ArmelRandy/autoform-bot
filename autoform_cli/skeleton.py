@@ -41,6 +41,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import SourceIndex, declaration_names, index_project, strip_lean_comments
@@ -279,7 +280,7 @@ class NodeSkeleton:
 
     @property
     def hash(self) -> str:
-        """What an article's ``skeleton_approved`` records: one hash over all its skeletons."""
+        """Return one semantic hash over all declarations behind an article."""
 
         if len(self.declarations) == 1:
             return self.declarations[0].hash
@@ -1332,12 +1333,14 @@ def source_passage(node: Node, blueprint: Path) -> tuple[str | None, str | None]
     """
 
     for target in node.sources:
-        path, _, fragment = target.partition("#")
+        parsed = urlsplit(target)
+        path = unquote(parsed.path)
+        fragment = unquote(parsed.fragment)
         match = _LINE_LOCATOR.fullmatch(fragment or "")
-        if match is None or not path or path.endswith(".md"):
+        if parsed.scheme or parsed.netloc or match is None or not path or path.endswith(".md"):
             continue
-        candidate = (node.path.parent / path).resolve()
         try:
+            candidate = (node.path.parent / path).resolve()
             candidate.relative_to(blueprint.resolve())
             # Lines are what an editor or `sed` counts: newline-separated. Python's
             # `splitlines` also breaks on form feeds, which `pdftotext` writes
@@ -1599,7 +1602,12 @@ def _output_identity(path: Path) -> tuple[int, int, str] | None:
     return metadata.st_dev, metadata.st_ino, digest.hexdigest()
 
 
-def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] | None:
+def validate_managed_output(
+    path: Path,
+    *,
+    kind: str,
+    schema: str | None = None,
+) -> tuple[int, int, str] | None:
     identity = _output_identity(path)
     if identity is None:
         return identity
@@ -1617,7 +1625,7 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"]) from exc
     if not isinstance(payload, dict):
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])
-    expected_schema = _PACKET_SCHEMA if kind == "packets" else _PASSAGE_SCHEMA
+    expected_schema = schema or (_PACKET_SCHEMA if kind == "packets" else _PASSAGE_SCHEMA)
     entries = payload.get(kind)
     if (
         payload.get("kind") != kind
@@ -1628,7 +1636,9 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
     return identity
 
 
-def _safe_node_path(node_id: str) -> Path:
+def article_output_path(node_id: str) -> Path:
+    """Return the safe relative output path for a blueprint article id."""
+
     path = Path(*node_id.split("/"))
     if (
         not node_id
@@ -1636,11 +1646,17 @@ def _safe_node_path(node_id: str) -> Path:
         or path.as_posix() != node_id
         or any(part in {"", ".", ".."} for part in path.parts)
     ):
-        raise SkeletonError([f"unsafe article id in packet output: {node_id!r}"])
+        raise SkeletonError([f"unsafe article id in managed output: {node_id!r}"])
     return path
 
 
-def _packet_filename(name: str) -> str:
+def declaration_filename(name: str, *, suffix: str = ".lean") -> str:
+    """Return a portable, collision-resistant filename for a Lean name."""
+
+    if not name:
+        raise ValueError("a declaration name cannot be empty")
+    if not suffix.startswith(".") or any(character in suffix for character in "/\\\0\r\n"):
+        raise ValueError(f"invalid declaration filename suffix: {suffix!r}")
     pieces: list[str] = []
     for character in name:
         if character.isascii() and (character.isalnum() or character in {".", "_", "-"}):
@@ -1651,10 +1667,10 @@ def _packet_filename(name: str) -> str:
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()
     if not encoded or len(os.fsencode(encoded)) > 180:
         encoded = "declaration"
-    return f"{encoded}--{digest}.lean"
+    return f"{encoded}--{digest}{suffix}"
 
 
-def _stage_output(destination: Path) -> Path:
+def stage_managed_output(destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     existing_mode: int | None = None
     try:
@@ -1680,7 +1696,7 @@ def _stage_output(destination: Path) -> Path:
     raise SkeletonError([f"cannot allocate staging directory beside {destination}"])
 
 
-def _replace_outputs(
+def replace_managed_outputs(
     outputs: list[tuple[Path, Path, tuple[int, int, str] | None]],
 ) -> None:
     """Commit staged output trees together, rolling all of them back on failure."""
@@ -1798,9 +1814,9 @@ def write_packets(
     )
     if passages_root is not None and _paths_overlap(root, passages_root):
         raise SkeletonError(["packet and passage output directories must be disjoint"])
-    root_identity = _validate_managed_output(root, kind="packets")
+    root_identity = validate_managed_output(root, kind="packets")
     passages_identity = (
-        _validate_managed_output(passages_root, kind="passages")
+        validate_managed_output(passages_root, kind="passages")
         if passages_root is not None
         else None
     )
@@ -1810,10 +1826,10 @@ def write_packets(
     manifest: list[dict[str, str]] = []
     passage_manifest: list[dict[str, str]] = []
     try:
-        packet_stage = _stage_output(root)
-        passages_stage = _stage_output(passages_root) if passages_root is not None else None
+        packet_stage = stage_managed_output(root)
+        passages_stage = stage_managed_output(passages_root) if passages_root is not None else None
         for node in report.nodes:
-            node_path = _safe_node_path(node.node_id)
+            node_path = article_output_path(node.node_id)
             passage_path: str | None = None
             if passages_stage is not None and node.passage is not None:
                 passage_relative = node_path / "passage.txt"
@@ -1837,7 +1853,7 @@ def write_packets(
                 article.write_text(node.blind_text(), encoding="utf-8")
                 written.append(root / article_relative)
             for declaration in node.declarations:
-                relative = node_path / _packet_filename(declaration.name)
+                relative = node_path / declaration_filename(declaration.name)
                 path = packet_stage / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(declaration.blind_text(), encoding="utf-8")
@@ -1882,7 +1898,7 @@ def write_packets(
         outputs = [(root, packet_stage, root_identity)]
         if passages_root is not None and passages_stage is not None:
             outputs.append((passages_root, passages_stage, passages_identity))
-        _replace_outputs(outputs)
+        replace_managed_outputs(outputs)
         packet_stage = None
         passages_stage = None
     except OSError as exc:
@@ -1929,6 +1945,8 @@ __all__ = [
     "SkeletonError",
     "SkeletonReport",
     "TrustedDeclaration",
+    "article_output_path",
+    "declaration_filename",
     "evidence_hash_of",
     "extract_graph_skeletons",
     "extract_skeletons",
@@ -1939,8 +1957,11 @@ __all__ = [
     "parse_probe_output",
     "path_of",
     "render_probe",
+    "replace_managed_outputs",
     "run_probe",
     "source_excerpt",
     "source_passage",
+    "stage_managed_output",
+    "validate_managed_output",
     "write_packets",
 ]

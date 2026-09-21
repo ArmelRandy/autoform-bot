@@ -19,13 +19,24 @@ from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_k
 from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
+from .readback import write_readback
 from .render import PublicationError, render_site
+from .review import (
+    ReviewError,
+    ReviewFinding,
+    build_review_bundle,
+    load_review_bundle,
+    review_findings,
+    validate_review_article,
+    validate_review_bundle,
+    write_review_bundle,
+    write_review_packets,
+)
 from .scaffold import ScaffoldError, scaffold_project
 from .skeleton import (
     SkeletonError,
     extract_skeletons,
     format_report,
-    load_skeleton_report,
     write_packets,
 )
 
@@ -64,9 +75,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     audit.add_argument("--json", action="store_true", help="write stable machine-readable output")
     audit.add_argument(
-        "--skeleton",
+        "--review-bundle",
         type=Path,
-        help="skeleton report from `autoform skeleton --output`; checks approvals and read-backs against it",
+        help="prepared review evidence; re-extracted and checked against the current Lean project",
     )
 
     doctor = subparsers.add_parser("doctor", help="diagnose the local Markdown runtime contract")
@@ -141,6 +152,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="with --packets: also write each article's cited source passage, for a faithfulness judge",
     )
 
+    review = subparsers.add_parser("review", help="prepare and verify statement-review evidence")
+    review_subparsers = review.add_subparsers(dest="review_command", required=True)
+    review_prepare = review_subparsers.add_parser(
+        "prepare",
+        help="prepare a current-tree evidence bundle and optional blind packets",
+    )
+    review_prepare.add_argument("blueprint_dir")
+    review_prepare.add_argument("--lean-root", type=Path, required=True)
+    review_prepare.add_argument("-o", "--output", type=Path, required=True)
+    review_prepare.add_argument("--packets", type=Path, metavar="DIR")
+
+    review_record = review_subparsers.add_parser(
+        "record",
+        help="validate and file testimony about one exact prepared packet",
+    )
+    review_record.add_argument("blueprint_dir")
+    review_record.add_argument("--lean-root", type=Path, required=True)
+    review_record.add_argument("--bundle", type=Path, required=True)
+    review_record.add_argument("--article-id", required=True, metavar="AF_ID")
+    review_record.add_argument("--declaration", required=True, metavar="LEAN_NAME")
+    review_record.add_argument("--packet", type=Path, required=True)
+    review_record.add_argument("--testimony", type=Path, required=True)
+    review_record.add_argument("--model", required=True)
+    review_record.add_argument(
+        "--expected-card-hash",
+        help="replace an existing different card only if its current content has this hash",
+    )
+
+    review_check = review_subparsers.add_parser(
+        "check",
+        help="check evidence freshness, read-backs, and human approvals",
+    )
+    review_check.add_argument("blueprint_dir")
+    review_check.add_argument("--lean-root", type=Path, required=True)
+    review_check.add_argument("--bundle", type=Path, required=True)
+    review_check.add_argument("--json", action="store_true", help="write stable machine-readable output")
+
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
     render.add_argument("-o", "--output", default="site-src", help="output directory")
@@ -153,9 +201,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="fail when a 'lean:' declaration is not found in the Lean sources",
     )
     render.add_argument(
-        "--skeleton",
+        "--review-bundle",
         type=Path,
-        help="skeleton report from `autoform skeleton --output`; adds a review disclosure to every statement",
+        help="prepared current-tree review evidence; adds validated review disclosures",
     )
 
     args = parser.parse_args(argv)
@@ -174,6 +222,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _migrate(args)
     if args.command == "skeleton":
         return _skeleton(args)
+    if args.command == "review":
+        return _review(args)
     if args.command == "render":
         return _render(args)
     return 2
@@ -267,14 +317,27 @@ def _check(args: argparse.Namespace) -> int:
 
 def _audit(args: argparse.Namespace) -> int:
     skeleton = None
-    if args.skeleton is not None:
+    bundle = None
+    if args.review_bundle is not None:
+        if args.lean_root is None:
+            print("error: --review-bundle requires --lean-root", file=sys.stderr)
+            return 2
         try:
-            skeleton = load_skeleton_report(args.skeleton)
-        except SkeletonError as exc:
+            _, skeleton, bundle = _current_review(
+                args.blueprint_dir,
+                lean_root=args.lean_root,
+                bundle_path=args.review_bundle,
+            )
+        except (GraphValidationError, ReviewError, SkeletonError) as exc:
             for issue in exc.issues:
                 print(f"error: {issue}", file=sys.stderr)
             return 2
-    result = audit_blueprint(args.blueprint_dir, lean_root=args.lean_root, skeleton=skeleton)
+    result = audit_blueprint(
+        args.blueprint_dir,
+        lean_root=args.lean_root,
+        skeleton=skeleton,
+        review_bundle=bundle,
+    )
     if args.json:
         print(result.to_json())
     else:
@@ -412,6 +475,167 @@ def _skeleton(args: argparse.Namespace) -> int:
     return 0 if report.clean else 1
 
 
+def _review(args: argparse.Namespace) -> int:
+    if args.review_command == "prepare":
+        return _review_prepare(args)
+    if args.review_command == "record":
+        return _review_record(args)
+    if args.review_command == "check":
+        return _review_check(args)
+    return 2
+
+
+def _review_prepare(args: argparse.Namespace) -> int:
+    output = args.output.expanduser().resolve()
+    if args.packets is not None:
+        packets = args.packets.expanduser().resolve()
+        if output == packets or output in packets.parents or packets in output.parents:
+            print("error: --output and --packets must be disjoint", file=sys.stderr)
+            return 2
+    try:
+        graph = load_graph(args.blueprint_dir)
+        skeleton = extract_skeletons(args.blueprint_dir, lean_root=args.lean_root)
+        bundle = build_review_bundle(graph, skeleton)
+        if args.packets is not None:
+            written = write_review_packets(bundle, args.packets)
+            print(f"{args.packets}: {len(written)} blind packet(s) written")
+        destination = write_review_bundle(bundle, args.output)
+    except (GraphValidationError, ReviewError, SkeletonError) as exc:
+        for issue in exc.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        return 2
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"{destination}: prepared {len(bundle.articles)} review article(s) · {bundle.hash}")
+    return 0
+
+
+def _review_record(args: argparse.Namespace) -> int:
+    try:
+        graph = load_graph(args.blueprint_dir)
+        bundle = load_review_bundle(args.bundle)
+        matches = [node for node in graph.nodes.values() if node.article_id == args.article_id]
+        if len(matches) != 1:
+            raise ReviewError(
+                [_review_selection_finding(args.article_id, args.declaration)]
+            )
+        selected_node = matches[0]
+        skeleton = extract_skeletons(
+            args.blueprint_dir,
+            lean_root=args.lean_root,
+            node_ids=(selected_node.id,),
+        )
+        findings = validate_review_article(
+            graph,
+            bundle,
+            skeleton,
+            args.article_id,
+        )
+        if findings:
+            raise ReviewError(findings)
+        prepared = bundle.declaration(args.article_id, args.declaration)
+        current_node = skeleton.node(selected_node.id)
+        current = None if current_node is None else next(
+            (item for item in current_node.declarations if item.name == args.declaration),
+            None,
+        )
+        if prepared is None or current is None:
+            raise ReviewError(
+                [
+                    # Keep selection failures under the same structured error
+                    # surface as stale or malformed review evidence.
+                    _review_selection_finding(args.article_id, args.declaration)
+                ]
+            )
+        packet_bytes = args.packet.read_bytes()
+        if packet_bytes != prepared.packet.encode("utf-8"):
+            raise ValueError(
+                f"packet bytes do not match the prepared declaration {args.declaration}"
+            )
+        try:
+            packet_text = packet_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"packet is not UTF-8: {args.packet}") from exc
+        testimony = args.testimony.read_text(encoding="utf-8")
+        path = write_readback(
+            graph.blueprint_dir,
+            article_id=args.article_id,
+            declaration=current,
+            model=args.model,
+            text=testimony,
+            packet_text=packet_text,
+            expected_card_hash=args.expected_card_hash,
+        )
+    except (GraphValidationError, ReviewError, SkeletonError) as exc:
+        for issue in exc.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        return 2
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"{path}: recorded read-back for {args.declaration}")
+    return 0
+
+
+def _review_check(args: argparse.Namespace) -> int:
+    try:
+        graph, skeleton, bundle = _current_review(
+            args.blueprint_dir,
+            lean_root=args.lean_root,
+            bundle_path=args.bundle,
+        )
+        findings = review_findings(graph, bundle, skeleton)
+    except (GraphValidationError, ReviewError, SkeletonError) as exc:
+        for issue in exc.issues:
+            print(f"error: {issue}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "bundle": bundle.hash,
+                    "clean": not findings,
+                    "findings": [
+                        {"code": item.code, "node_id": item.node_id, "reason": item.reason}
+                        for item in findings
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    elif findings:
+        for finding in findings:
+            print(f"error: {finding.node_id}: {finding.code}: {finding.reason}")
+    else:
+        print(f"OK: statement reviews match {bundle.hash}")
+    return 1 if findings else 0
+
+
+def _current_review(
+    blueprint_dir: str | Path,
+    *,
+    lean_root: Path,
+    bundle_path: Path,
+):
+    graph = load_graph(blueprint_dir)
+    skeleton = extract_skeletons(blueprint_dir, lean_root=lean_root)
+    bundle = load_review_bundle(bundle_path)
+    findings = validate_review_bundle(graph, bundle, skeleton)
+    if findings:
+        raise ReviewError(findings)
+    return graph, skeleton, bundle
+
+
+def _review_selection_finding(article_id: str, declaration: str) -> ReviewFinding:
+    return ReviewFinding(
+        article_id,
+        "review-selection-missing",
+        f"prepared review bundle has no declaration {declaration!r} for article_id {article_id}",
+    )
+
+
 def _claim_board(args: argparse.Namespace) -> ClaimBoard:
     worker_id = args.worker_id
     if not worker_id:
@@ -443,7 +667,17 @@ def _default_claim_scratch(repo: str, worker_id: str) -> Path:
 
 def _render(args: argparse.Namespace) -> int:
     try:
-        skeleton = load_skeleton_report(args.skeleton) if args.skeleton is not None else None
+        skeleton = None
+        bundle = None
+        if args.review_bundle is not None:
+            if args.lean_root is None:
+                print("error: --review-bundle requires --lean-root", file=sys.stderr)
+                return 2
+            _, skeleton, bundle = _current_review(
+                args.blueprint_dir,
+                lean_root=args.lean_root,
+                bundle_path=args.review_bundle,
+            )
         report = render_site(
             args.blueprint_dir,
             args.output,
@@ -451,8 +685,9 @@ def _render(args: argparse.Namespace) -> int:
             repository_url=args.repository_url,
             ref=args.ref,
             skeleton=skeleton,
+            review_bundle=bundle,
         )
-    except (GraphValidationError, PublicationError, SkeletonError) as exc:
+    except (GraphValidationError, PublicationError, ReviewError, SkeletonError) as exc:
         for issue in exc.issues:
             print(f"error: {issue}")
         return 1

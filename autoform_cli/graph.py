@@ -15,11 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from .markdown import content_lines
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _LINK = re.compile(r"(?<!!)\[[^\]]+\]\(\s*(<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
-_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
 _INLINE_CODE = re.compile(r"(`+).*?\1")
 ARTICLE_ID_PATTERN = re.compile(r"af_[0-9a-f]{24}\Z")
 _FRONTMATTER_KEYS = frozenset(
@@ -35,8 +34,7 @@ _FRONTMATTER_KEYS = frozenset(
         "not_ready",
         "origin",
         "discussion",
-        "skeleton_approved",
-        "skeleton_evidence",
+        "review_approved",
     }
 )
 _SKELETON_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -92,12 +90,9 @@ class Node:
     depth: int = 0
     article_id: str | None = None
     source_sha256: str | None = None
-    #: The skeleton hash a human approved, from ``skeleton_approved``. The
-    #: audit compares it with the current skeleton and reports drift.
-    skeleton_approved: str | None = None
-    #: The evidence hash of the joint packet that person read, from
-    #: ``skeleton_evidence``; optional, checked when present.
-    skeleton_evidence: str | None = None
+    #: Hash of the complete review surface a person approved. Unlike the
+    #: skeleton alone, this binds the article, source, and read-backs.
+    review_approved: str | None = None
 
     @property
     def formalizable(self) -> bool:
@@ -229,8 +224,7 @@ def load_graph(blueprint_dir: str | Path) -> Graph:
             depth=_article_depth(parsed_node.id, parents),
             article_id=metadata.get("article_id"),
             source_sha256=source_hashes[parsed_node.id],
-            skeleton_approved=metadata.get("skeleton_approved"),
-            skeleton_evidence=metadata.get("skeleton_evidence"),
+            review_approved=metadata.get("review_approved"),
         )
 
     if not issues:
@@ -376,22 +370,9 @@ def _parse_node(node_id: str, path: Path, text: str) -> tuple[_ParsedNode | None
         _SOURCES_SECTION: [],
     }
     section: str | None = None
-    fence: tuple[str, int] | None = None
-    body = _HTML_COMMENT.sub("", "\n".join(lines[body_start:]))
+    body = "\n".join(lines[body_start:])
 
-    for line in body.splitlines():
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            marker_kind = marker[0]
-            if fence is None:
-                fence = (marker_kind, len(marker))
-            elif marker_kind == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-
+    for line in content_lines(body):
         heading = _HEADING.match(line)
         if heading:
             level = len(heading.group(1))
@@ -487,9 +468,9 @@ def _normalize_value(node_id: str, line_number: int, key: str, value: str) -> tu
         if folded not in {"cited", "bridged", "background"}:
             return value, f"{location}: 'origin' accepts cited, bridged, or background"
         return folded, None
-    if key in {"skeleton_approved", "skeleton_evidence"}:
+    if key == "review_approved":
         if not _SKELETON_HASH.fullmatch(folded):
-            return value, f"{location}: '{key}' must be a `sha256:<64 hex>` hash from `autoform skeleton`"
+            return value, f"{location}: '{key}' must be a `sha256:<64 hex>` hash from `autoform review`"
         return folded, None
     return value, None
 

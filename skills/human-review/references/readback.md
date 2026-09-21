@@ -9,10 +9,10 @@ read-back audits used by [Prove2me](https://prove2.me).
 
 ## You are working blind, and that is the point
 
-You have been given a packet: the comment-stripped skeleton of one
-declaration, written by `autoform skeleton --packets`. It holds the elaborated
-signature of a theorem or definition and the source of every project
-definition the statement rests on, with all comments and docstrings removed.
+You have been given one prepared packet: the comment-stripped skeleton of one
+declaration. It holds the elaborated signature of a theorem or definition and
+the source of every project definition the statement rests on, with all
+comments and docstrings removed.
 
 You have not been given the article, the source text, or any description of
 the intent, and you must not look for them. Do not open the blueprint, the
@@ -53,44 +53,19 @@ packet. Completeness beats elegance: this is fine print. Introduce every
 variable and symbol before using it, put the main assertion in display math,
 and use a short list when the statement has several clauses.
 
-## Filing
+Use inert Markdown only. Raw HTML, Markdown links, images, autolinks, link
+definitions, visibility-changing attributes, and Mermaid blocks are rejected when the coordinator records
+the testimony. They add no mathematical content and would let generated prose
+run code or fetch remote resources in the published review site.
 
-Write the read-back to the vault at
+## Return only testimony
 
-```text
-blueprint/readbacks/<article id>/<Lean name>.md
-```
+Return only the Markdown testimony described above. Do not create a vault
+card, copy metadata, infer a destination path, or inspect a manifest. The
+coordinator records your response with the exact packet through Autoform's
+`review record` command. That command rejects a response if the prepared
+bundle, current Lean declaration, or packet bytes no longer agree.
 
-as a review card: frontmatter copying `declaration`, `hash` (as `skeleton`)
-and `packet_hash` (as `packet`) from the packet manifest entry you were given
-and naming the model that wrote the text, a
-title, the packet verbatim in a `lean` block under `## Skeleton`, and the
-testimony under `## Read-back`. The `autoform_cli.readback.write_readback`
-helper writes this layout; only the text under `## Read-back` is published:
-
-```markdown
----
-declaration: RealAnalysis.isInf_one_div_nat
-skeleton: sha256:3f9a2c1d…   # the semantic hash, copied in full
-packet: sha256:8c4e1b2a…     # the evidence hash of the packet read, in full
-model: claude-fable-5-1       # a label, not provenance: nothing verifies it
----
-
-# RealAnalysis.isInf_one_div_nat
-
-## Skeleton
-
-```lean
--- theorem RealAnalysis.isInf_one_div_nat
-...
-```
-
-## Read-back
-
-Let $S$ be ...
-```
-
-A read-back testifies about one skeleton. If the skeleton's meaning changes,
-the audit reports the read-back as stale and it must be rewritten from the
-new packet; if only the packet text changes, it is reported as revised and
-should be re-read against the new packet.
+A read-back testifies about one exact packet. If either the packet's meaning
+or its bytes change, a coordinator must request a new blind read-back. Never
+revise old testimony after seeing an article or intended statement.

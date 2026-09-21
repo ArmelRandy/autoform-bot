@@ -37,42 +37,55 @@ from the person's judgment. Do not silently apply requested revisions: hand
 mathematical-plan changes to Roadmap, Lean implementation changes to
 Orchestrate, and autonomous rubric scoring to Agent Review.
 
-## Review formalized statements through skeletons and read-backs
+## Review formalized statements through prepared evidence and read-backs
 
 A compiled proof says nothing about whether the statement means what the book
-says. The person reviews the *skeleton* instead: the elaborated signature and
-the project definitions it rests on, a few lines per result, and beside it a
-*read-back*, a blind rendering in mathematical English of what that skeleton
-literally asserts. The reviewer compares the book statement, the skeleton, and
-the read-back on one screen; the kernel covers everything below.
+says. The person reviews a *prepared review bundle*: the current article
+statement and cited passage, the elaborated Lean signature, and the project
+definitions it rests on. Beside that evidence they read an independent
+*read-back*, a blind rendering in mathematical English of what one exact Lean
+packet literally asserts. The kernel covers everything below this surface.
 
-1. Extract the skeletons from the built project and write the blind packets,
-   with the `skeleton` command in the [CLI reference](../../autoform_cli/README.md#commands):
-   `autoform skeleton blueprint --lean-root . --output skeleton.json --packets review-packets`.
-2. Obtain a read-back for every packet that has none or is stale. Never write
-   one yourself: you know what the code is meant to say. For each packet,
-   launch an independent sub-agent with a fresh context and give it only that
-   declaration's packet file and [the read-back reference](references/readback.md); file its
-   testimony under `blueprint/readbacks/<article id>/<Lean name>.md` with the
-   skeleton hash and packet hash from the packet manifest and the model's name.
-3. Render with the report, `autoform render … --skeleton skeleton.json`, and
-   strict-build the site. Every statement box gains a *Review* disclosure with
-   the skeleton, the assumed library notions, the axioms, the read-back, and
-   the approval state.
-4. Walk the person through each statement: book text first, then the
-   read-back, then the skeleton. Ask whether the read-back says what the book
-   says, whether any hypothesis is missing or added, and whether the
-   definitions mean what the book's do. When they approve, record it as a
-   checked fact in the article's frontmatter, `skeleton_approved: <hash>`
-   with the article hash the report shows, and `skeleton_evidence: <hash>`
-   with the article's evidence hash, so the approval names both the meaning
-   and the exact packet the person read; this is the one vault write review
-   makes, and it is the person's assertion, not yours. When they do not,
-   record `revise` with their reason and hand the change to Roadmap or
-   Orchestrate.
-5. Run `autoform audit blueprint --skeleton skeleton.json` before reporting.
-   It names every approval whose skeleton has since moved (`skeleton-drift`)
-   or whose packet text has (`skeleton-evidence-drift`), and every read-back
-   that is missing, stale, revised, altered after filing, or left behind by a
-   renamed statement, so an edit to a statement can never keep an approval it
-   was not given.
+Use the `review` commands and review-bundle flags documented in the
+[CLI reference](../../autoform_cli/README.md#commands). Do not substitute a
+saved skeleton report: preparation, recording, auditing, and rendering each
+check that the evidence still describes the current blueprint and built Lean
+tree.
+
+1. Confirm that the repository has opted into enforcement with the versioned
+   `blueprint/.autoform-review` policy marker. Require durable `article_id`
+   metadata for every Lean-mapped article, using the article-ID migration check
+   in the CLI reference. Every `origin: cited` Lean article must identify an
+   exact line range in a local, non-Markdown source snapshot. Build the Lean project, then prepare a versioned review
+   bundle and its blind packets. Keep the bundle and its identity manifest with
+   the coordinator. A packet is the only input that crosses the blind-review
+   boundary; its opaque filename must not reveal the article or declaration.
+2. Obtain a read-back for every packet that has none or whose card is invalid.
+   Never write one yourself: you know what the code is meant to say. Launch an
+   independent sub-agent in a fresh workspace containing only that packet and
+   [the read-back reference](references/readback.md). Do not give it the
+   repository, article, source passage, bundle manifest, or a revealing task
+   description. Ask for testimony only.
+3. Back in the coordinator's workspace, record the testimony through the CLI.
+   Pass the prepared bundle and the exact packet file the agent read. The
+   command resolves the durable article ID, re-extracts the current Lean
+   evidence, rejects a stale bundle or changed packet, and writes the vault
+   card. Never hand-author or repair a card's path, hashes, or frontmatter.
+4. Audit and render from that same bundle, then strict-build the site. Both
+   commands re-extract current evidence and fail closed if the bundle is stale,
+   incomplete, or inconsistent. Every formalized statement gains a *Review*
+   disclosure showing the exact hashed packet, its read-back, the article and
+   source evidence it is bound to, and the approval state.
+5. Walk the person through each statement: source and book text first, then the
+   read-back, then the exact packet. Ask whether the read-back says what the
+   book says, whether any hypothesis is missing or added, and whether the
+   definitions mean what the book's do. When they approve, copy the complete
+   per-article review hash shown by the validated review view into
+   `review_approved`. That hash binds the article title and statement, cited passage,
+   exact packets, and current read-backs. This edit is the person's assertion,
+   not the agent's. When they do not approve, record `revise` with their reason
+   and hand the change to Roadmap or Orchestrate.
+6. Run the review-aware audit again before reporting. Treat missing testimony,
+   unresolved extraction, an incomplete bundle, any packet or read-back
+   mismatch, and any approval drift as failures. An edit to any reviewed input
+   must invalidate the approval it changed.
