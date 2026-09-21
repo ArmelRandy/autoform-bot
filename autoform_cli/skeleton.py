@@ -1223,7 +1223,7 @@ def extract_skeletons(
         node_ids=node_ids,
     )
     if runner is None and index_project(root).source_digest != index.source_digest:
-        raise SkeletonError(["Lean sources changed while skeletons were being extracted; retry after the build is idle"])
+        raise SkeletonError(["Lean sources changed during skeleton extraction; retry after the build is idle"])
     return report
 
 
