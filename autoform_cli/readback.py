@@ -31,7 +31,7 @@ import secrets
 import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 from urllib.parse import unquote_to_bytes
 
 import html5lib
@@ -316,6 +316,32 @@ def load_readbacks(blueprint: str | Path) -> dict[tuple[str, str], Readback]:
     return found
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedReadback:
+    """A finished card, not yet written: where it goes and exactly what it says.
+
+    A request names inputs (a packet file and a testimony file); this is the
+    output built from them: the card's destination and its complete text, with
+    the packet and testimony embedded. :func:`prepare_readback` builds one only
+    after every check passes, so a batch can check all its cards before
+    :func:`publish_readback` writes the first.
+    """
+
+    #: The blueprint the card is filed in; publishing opens it without
+    #: following links.
+    blueprint: Path
+    article_id: str
+    declaration: str
+    #: Destination, ``<blueprint>/readbacks/<article_id>/<Declaration>--<sha256 of
+    #: the name>.md``. It depends only on the name, so a re-review of a changed
+    #: packet lands on the card it supersedes.
+    path: Path
+    #: The complete card: frontmatter, packet, and testimony.
+    content: str
+    #: Carried from the request: the hash of the card this one may replace.
+    expected_card_hash: str | None
+
+
 def write_readback(
     blueprint: str | Path,
     *,
@@ -336,6 +362,33 @@ def write_readback(
     names it. This compare-and-swap rule prevents asynchronous reviewers from
     silently overwriting one another. Filing identical content is idempotent.
     """
+
+    return publish_readback(
+        prepare_readback(
+            blueprint,
+            article_id=article_id,
+            declaration=declaration,
+            model=model,
+            text=text,
+            packet_text=packet_text,
+            expected_card_hash=expected_card_hash,
+        )
+    )
+
+
+def prepare_readback(
+    blueprint: str | Path,
+    *,
+    article_id: str,
+    declaration: DeclarationSkeleton,
+    model: str,
+    text: str,
+    packet_text: str,
+    expected_card_hash: str | None = None,
+) -> PreparedReadback:
+    """Run every check :func:`write_readback` runs, and build the card, without
+    touching the filesystem. A caller filing several cards prepares them all
+    first, so that one bad card stops the batch before any is written."""
 
     blueprint_path = Path(blueprint).expanduser().resolve()
     path = readback_path(blueprint_path, article_id, declaration.name)
@@ -363,17 +416,97 @@ def write_readback(
         packet_text=packet_text,
         testimony=text,
     )
-    parent_descriptor = _open_card_parent(blueprint_path, article_id)
+    return PreparedReadback(
+        blueprint=blueprint_path,
+        article_id=article_id,
+        declaration=declaration.name,
+        path=path,
+        content=content,
+        expected_card_hash=expected_card_hash,
+    )
+
+
+def planned_readback(
+    blueprint: str | Path,
+    *,
+    article_id: str,
+    declaration: str,
+    skeleton_hash: str,
+    packet_hash: str,
+    model: str,
+    text: str,
+    packet_text: str,
+    expected_card_hash: str | None = None,
+) -> PreparedReadback:
+    """The card a record would file, built from prepared evidence before Lean runs.
+
+    It is not checked against the current Lean tree and must never be
+    published; :func:`prepare_readback` builds the card that is. When the
+    prepared evidence is current, the two are identical, so a batch can find
+    the cards it would conflict with before paying for an extraction.
+    """
+
+    blueprint_path = Path(blueprint).expanduser().resolve()
+    return PreparedReadback(
+        blueprint=blueprint_path,
+        article_id=article_id,
+        declaration=declaration,
+        path=readback_path(blueprint_path, article_id, declaration),
+        content=_card_content(
+            article_id=article_id,
+            declaration=declaration,
+            skeleton_hash=skeleton_hash,
+            packet_hash=packet_hash,
+            model=model,
+            packet_text=packet_text,
+            testimony=text,
+        ),
+        expected_card_hash=expected_card_hash,
+    )
+
+
+def readback_conflicts(cards: Iterable[PreparedReadback]) -> list[str]:
+    """Every card publishing would refuse, found without writing anything.
+
+    This is the compare-and-swap rule :func:`publish_readback` applies, checked
+    for a whole batch first: a card may replace existing different content
+    only when it names that content's hash. Each conflict names the hash to
+    pass. Publishing still checks each card, since another writer can act in
+    between.
+    """
+
+    conflicts: list[str] = []
+    for card in cards:
+        before = _existing_card_hash(card.blueprint, card.article_id, card.path)
+        if before is None or before == evidence_hash_of(card.content):
+            continue
+        if card.expected_card_hash is None:
+            conflicts.append(
+                f"{card.declaration}: read-back already exists with different content: {card.path}; "
+                f"to replace it, pass expected_card_hash={before!r}"
+            )
+        elif card.expected_card_hash != before:
+            conflicts.append(
+                f"{card.declaration}: read-back changed before replacement: "
+                f"expected {card.expected_card_hash!r}, found {before!r}"
+            )
+    return conflicts
+
+
+def publish_readback(prepared: PreparedReadback) -> Path:
+    """Publish a prepared card under the same compare-and-swap rule."""
+
+    parent_descriptor = _open_card_parent(prepared.blueprint, prepared.article_id)
     try:
         _publish_card(
             parent_descriptor,
-            path,
-            content,
-            expected_card_hash=expected_card_hash,
+            prepared.path,
+            prepared.content,
+            expected_card_hash=prepared.expected_card_hash,
         )
     finally:
         os.close(parent_descriptor)
-    return path
+    return prepared.path
 
 
 @dataclass(frozen=True, slots=True)
@@ -735,6 +868,34 @@ def _open_card_parent(blueprint: Path, article_id: str) -> int:
         raise
 
 
+def _existing_card_hash(blueprint: Path, article_id: str, path: Path) -> str | None:
+    """Hash the card at ``path`` through no-follow descriptors, creating nothing.
+
+    A missing directory on the way means there is no card yet.
+    """
+
+    if not ARTICLE_ID_PATTERN.fullmatch(article_id):
+        raise ValueError(f"invalid article_id for a read-back: {article_id!r}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        current = os.open(blueprint, flags)
+    except OSError as exc:
+        raise ValueError(f"cannot safely open blueprint directory: {blueprint}") from exc
+    try:
+        for part in Path(READBACKS_DIR, article_id).parts:
+            try:
+                following = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise ValueError(f"refusing a symlink or unsafe component in the read-back path: {part}") from exc
+            os.close(current)
+            current = following
+        return _card_hash_at(current, path.name, path)
+    finally:
+        os.close(current)
+
+
 def _card_hash_at(directory: int, filename: str, display_path: Path) -> str | None:
     """Read a card relative to a held directory without following links."""
 
@@ -906,9 +1067,14 @@ __all__ = [
     "READBACKS_DIR",
     "READBACK_HEADING",
     "READBACK_SCHEMA",
+    "PreparedReadback",
     "Readback",
     "ReadbackFinding",
     "load_readbacks",
+    "planned_readback",
+    "prepare_readback",
+    "publish_readback",
+    "readback_conflicts",
     "readback_findings",
     "readback_path",
     "write_readback",

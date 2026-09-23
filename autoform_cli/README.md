@@ -389,6 +389,8 @@ autoform review record blueprint --lean-root . --bundle review.json \
   --article-id af_0123456789abcdef01234567 --declaration Ns.result \
   --packet review-packets/blind/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.lean \
   --testimony read-back.md --model muse-spark-1.1
+autoform review record blueprint --lean-root . --bundle review.json \
+  --manifest records.json --model muse-spark-1.1
 autoform review check blueprint --lean-root . --bundle review.json
 autoform audit blueprint --lean-root . --review-bundle review.json
 autoform render blueprint --lean-root . --review-bundle review.json
@@ -402,7 +404,39 @@ to an in-vault, non-Markdown source snapshot with an exact
 `#L<start>-L<end>` range; preparation refuses a citation it cannot put before
 the reviewer. `review record` rechecks the selected current article
 and the exact packet bytes before filing a card; an unrelated article changing
-does not block that record. `review check`, `audit`, and `render` re-extract the
+does not block that record.
+
+`--manifest` files a batch against one extraction, where one record per card
+would pay a Lake freshness check and a Lean start each. The manifest reuses
+the packet manifest's field names, so a coordinator derives it from the one
+`review prepare` writes by adding the testimony for each packet:
+
+```json
+{
+  "schema": "autoform-review-records/v1",
+  "records": [
+    {"article_id": "af_0123456789abcdef01234567", "declaration": "Ns.result",
+     "packet": "review-packets/blind/0123….lean", "testimony": "read-back.md"}
+  ]
+}
+```
+
+Relative paths resolve against the manifest's directory, a record may carry its
+own `expected_card_hash`, and a declaration may appear once. Every packet and
+testimony is read and checked against the bundle before Lean starts. So is
+every card the batch would write over: a re-review lands on the path of the
+card it supersedes, which it may replace only by naming that card's hash, and
+the batch lists every card that needs one, with the hash, before extracting. The
+extraction is scoped to exactly the batch's articles, and each article is
+validated against its own part of it, as a single record would be. The
+blueprint is then reloaded: if any selected article changed while Lean ran,
+nothing is filed. Every card is built and checked before the first is written,
+so one bad record stops the batch. Publishing then goes card by card, each
+under its own compare-and-swap; only a concurrent writer can stop it midway,
+the command says how many cards it filed, and because filing identical content
+is a no-op, running the same batch again completes it.
+
+`review check`, `audit`, and `render` re-extract the
 current Lean evidence and reject unresolved, partial, foreign, or stale
 bundles. `review check` also requires complete current cards and matching human
 approvals. The rendered review disclosure uses the same packet bytes that were

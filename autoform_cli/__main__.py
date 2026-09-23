@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import status
@@ -17,14 +18,18 @@ from .article_identity import plan_article_ids
 from .audit import audit_blueprint
 from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
 from .doctor import diagnose_project
-from .graph import GraphValidationError, load_graph
+from .graph import Graph, GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
-from .readback import write_readback
+from .readback import PreparedReadback, planned_readback, prepare_readback, publish_readback, readback_conflicts
 from .render import PublicationError, render_site
 from .review import (
+    RecordRequest,
+    ReviewBundle,
+    ReviewDeclaration,
     ReviewError,
     ReviewFinding,
     build_review_bundle,
+    load_record_manifest,
     load_review_bundle,
     review_findings,
     validate_review_article,
@@ -35,6 +40,7 @@ from .review import (
 from .scaffold import ScaffoldError, scaffold_project
 from .skeleton import (
     SkeletonError,
+    SkeletonReport,
     extract_skeletons,
     format_report,
     write_packets,
@@ -165,15 +171,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     review_record = review_subparsers.add_parser(
         "record",
-        help="validate and file testimony about one exact prepared packet",
+        help="validate and file testimony about exact prepared packets, one or a batch",
     )
     review_record.add_argument("blueprint_dir")
     review_record.add_argument("--lean-root", type=Path, required=True)
     review_record.add_argument("--bundle", type=Path, required=True)
-    review_record.add_argument("--article-id", required=True, metavar="AF_ID")
-    review_record.add_argument("--declaration", required=True, metavar="LEAN_NAME")
-    review_record.add_argument("--packet", type=Path, required=True)
-    review_record.add_argument("--testimony", type=Path, required=True)
+    review_record.add_argument(
+        "--manifest",
+        type=Path,
+        help="file every record this manifest lists against one extraction, instead of the four flags below",
+    )
+    review_record.add_argument("--article-id", metavar="AF_ID")
+    review_record.add_argument("--declaration", metavar="LEAN_NAME")
+    review_record.add_argument("--packet", type=Path)
+    review_record.add_argument("--testimony", type=Path)
     review_record.add_argument("--model", required=True)
     review_record.add_argument(
         "--expected-card-hash",
@@ -512,70 +523,275 @@ def _review_prepare(args: argparse.Namespace) -> int:
 
 
 def _review_record(args: argparse.Namespace) -> int:
-    try:
-        graph = load_graph(args.blueprint_dir)
-        bundle = load_review_bundle(args.bundle)
-        matches = [node for node in graph.nodes.values() if node.article_id == args.article_id]
-        if len(matches) != 1:
-            raise ReviewError(
-                [_review_selection_finding(args.article_id, args.declaration)]
+    single = (args.article_id, args.declaration, args.packet, args.testimony)
+    if args.manifest is not None:
+        if any(value is not None for value in single) or args.expected_card_hash is not None:
+            print(
+                "error: --manifest replaces --article-id, --declaration, --packet, --testimony, "
+                "and --expected-card-hash",
+                file=sys.stderr,
             )
-        selected_node = matches[0]
+            return 2
+    elif any(value is None for value in single):
+        print(
+            "error: record needs --manifest, or all of --article-id, --declaration, --packet, and --testimony",
+            file=sys.stderr,
+        )
+        return 2
+
+    written: list[tuple[Path, str]] = []
+    requests: tuple[RecordRequest, ...] = ()
+    try:
+        requests = (
+            load_record_manifest(args.manifest)
+            if args.manifest is not None
+            else (
+                RecordRequest(
+                    article_id=args.article_id,
+                    declaration=args.declaration,
+                    packet=args.packet,
+                    testimony=args.testimony,
+                    expected_card_hash=args.expected_card_hash,
+                ),
+            )
+        )
+        bundle = load_review_bundle(args.bundle)
+        # Every input is read, and checked against the prepared bundle, before
+        # any Lean work: a missing file or a changed packet stops the batch
+        # without an extraction.
+        inputs = _record_inputs(bundle, requests)
+        # So is every card that would replace different content without naming
+        # it: all of them at once, rather than one per extraction.
+        _refuse_conflicts(_planned_records(args.blueprint_dir, inputs, model=args.model))
+        graph = load_graph(args.blueprint_dir)
+        before = _record_snapshot(graph, requests)
+        # One extraction serves every record in the batch.
         skeleton = extract_skeletons(
             args.blueprint_dir,
             lean_root=args.lean_root,
-            node_ids=(selected_node.id,),
+            node_ids=tuple(sorted({node_id for _, node_id, _, _ in before})),
         )
-        findings = validate_review_article(
-            graph,
-            bundle,
-            skeleton,
-            args.article_id,
-        )
-        if findings:
-            raise ReviewError(findings)
-        prepared = bundle.declaration(args.article_id, args.declaration)
-        current_node = skeleton.node(selected_node.id)
-        current = None if current_node is None else next(
-            (item for item in current_node.declarations if item.name == args.declaration),
-            None,
-        )
-        if prepared is None or current is None:
+        # The extraction must describe the blueprint the cards are filed
+        # against. Reload it and refuse if any selected article changed while
+        # Lean ran; otherwise the evidence below would pair a graph and a Lean
+        # state that never coexisted.
+        graph = load_graph(args.blueprint_dir)
+        if _record_snapshot(graph, requests) != before:
             raise ReviewError(
                 [
-                    # Keep selection failures under the same structured error
-                    # surface as stale or malformed review evidence.
-                    _review_selection_finding(args.article_id, args.declaration)
+                    ReviewFinding(
+                        "record",
+                        "review-snapshot-changed",
+                        "an article being recorded changed during extraction; nothing was filed, so rerun the record",
+                    )
                 ]
             )
-        packet_bytes = args.packet.read_bytes()
-        if packet_bytes != prepared.packet.encode("utf-8"):
-            raise ValueError(
-                f"packet bytes do not match the prepared declaration {args.declaration}"
-            )
-        try:
-            packet_text = packet_bytes.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"packet is not UTF-8: {args.packet}") from exc
-        testimony = args.testimony.read_text(encoding="utf-8")
-        path = write_readback(
-            graph.blueprint_dir,
-            article_id=args.article_id,
-            declaration=current,
-            model=args.model,
-            text=testimony,
-            packet_text=packet_text,
-            expected_card_hash=args.expected_card_hash,
-        )
+        findings = [
+            finding
+            for article_id, node_id, _, _ in before
+            for finding in validate_review_article(graph, bundle, _article_report(skeleton, node_id), article_id)
+        ]
+        if findings:
+            raise ReviewError(findings)
+        cards = _prepare_records(graph, skeleton, inputs, model=args.model)
+        _refuse_conflicts(cards)
+        # Every card has passed every check. Publish them in order; each keeps
+        # its own compare-and-swap, and filing identical content is a no-op, so
+        # a batch interrupted here is completed by running it again.
+        for card in cards:
+            written.append((publish_readback(card), card.declaration))
     except (GraphValidationError, ReviewError, SkeletonError) as exc:
+        _report_recorded(written, len(requests))
         for issue in exc.issues:
             print(f"error: {issue}", file=sys.stderr)
         return 2
     except (OSError, UnicodeError, ValueError) as exc:
+        _report_recorded(written, len(requests))
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(f"{path}: recorded read-back for {args.declaration}")
+    _report_recorded(written, len(requests))
     return 0
+
+
+def _article_report(report: SkeletonReport, node_id: str) -> SkeletonReport:
+    """The part of a shared extraction that one article's validation may see.
+
+    ``validate_review_article`` insists on a report scoped to exactly its own
+    article, so that missing evidence cannot pass. A batch extracts several
+    articles at once and hands each its own node. An unresolved issue that
+    cannot be attributed to a node stays with every article, and fails them all.
+    """
+
+    prefixes = tuple(f"{node.node_id}: " for node in report.nodes)
+    return replace(
+        report,
+        nodes=tuple(node for node in report.nodes if node.node_id == node_id),
+        unresolved=tuple(
+            issue
+            for issue in report.unresolved
+            if issue.startswith(f"{node_id}: ") or not issue.startswith(prefixes)
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordInput:
+    """One request, the bundle entry it names, and the two texts it points to."""
+
+    request: RecordRequest
+    #: The declaration as ``review prepare`` recorded it: packet and hashes.
+    prepared: ReviewDeclaration
+    #: The packet the auditor read; equal to ``prepared.packet``.
+    packet: str
+    #: What the auditor wrote about it.
+    testimony: str
+
+
+def _record_inputs(bundle: ReviewBundle, requests: tuple[RecordRequest, ...]) -> list[_RecordInput]:
+    """Read each packet and testimony, and check the packet against the bundle.
+
+    Every request is looked at before anything is refused, so one run names
+    every unknown declaration, unreadable file, and changed packet at once.
+    """
+
+    findings: list[ReviewFinding] = []
+    inputs: list[_RecordInput] = []
+    for request in requests:
+        prepared = bundle.declaration(request.article_id, request.declaration)
+        if prepared is None:
+            findings.append(_review_selection_finding(request.article_id, request.declaration))
+            continue
+        try:
+            packet_bytes = request.packet.read_bytes()
+        except OSError as exc:
+            findings.append(_unreadable_input(request, "packet", request.packet, exc))
+            continue
+        if packet_bytes != prepared.packet.encode("utf-8"):
+            findings.append(
+                ReviewFinding(
+                    request.article_id,
+                    "review-packet-mismatch",
+                    f"packet bytes do not match the prepared declaration {request.declaration}",
+                )
+            )
+            continue
+        try:
+            testimony = request.testimony.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            findings.append(_unreadable_input(request, "testimony", request.testimony, exc))
+            continue
+        # Equal to the bundle's text, so already valid UTF-8.
+        inputs.append(_RecordInput(request, prepared, packet_bytes.decode("utf-8"), testimony))
+    if findings:
+        raise ReviewError(findings)
+    return inputs
+
+
+def _unreadable_input(request: RecordRequest, role: str, path: Path, exc: Exception) -> ReviewFinding:
+    return ReviewFinding(
+        request.article_id,
+        "review-input-unreadable",
+        f"{request.declaration}: cannot read the {role} {path}: {exc}",
+    )
+
+
+def _planned_records(
+    blueprint: str | Path,
+    inputs: list[_RecordInput],
+    *,
+    model: str,
+) -> list[PreparedReadback]:
+    """The cards the batch would file if the prepared evidence is current."""
+
+    return [
+        planned_readback(
+            blueprint,
+            article_id=item.request.article_id,
+            declaration=item.request.declaration,
+            skeleton_hash=item.prepared.skeleton_hash,
+            packet_hash=item.prepared.packet_hash,
+            model=model,
+            text=item.testimony,
+            packet_text=item.packet,
+            expected_card_hash=item.request.expected_card_hash,
+        )
+        for item in inputs
+    ]
+
+
+def _refuse_conflicts(cards: list[PreparedReadback]) -> None:
+    conflicts = readback_conflicts(cards)
+    if conflicts:
+        raise ReviewError([ReviewFinding("record", "review-card-conflict", conflict) for conflict in conflicts])
+
+
+def _record_snapshot(graph: Graph, requests: tuple[RecordRequest, ...]) -> tuple[tuple[str, str, str, str], ...]:
+    """What each selected article is right now: its node, file, and source hash."""
+
+    state: dict[str, tuple[str, str, str, str]] = {}
+    for request in requests:
+        if request.article_id in state:
+            continue
+        matches = [node for node in graph.nodes.values() if node.article_id == request.article_id]
+        if len(matches) != 1:
+            raise ReviewError([_review_selection_finding(request.article_id, request.declaration)])
+        node = matches[0]
+        state[request.article_id] = (request.article_id, node.id, str(node.path), node.source_sha256 or "")
+    return tuple(sorted(state.values()))
+
+
+def _prepare_records(
+    graph: Graph,
+    skeleton: SkeletonReport,
+    inputs: list[_RecordInput],
+    *,
+    model: str,
+) -> list[PreparedReadback]:
+    """Build every card against the one extraction, or refuse the batch."""
+
+    findings: list[ReviewFinding] = []
+    cards: list[PreparedReadback] = []
+    for item in inputs:
+        request = item.request
+        node = next(node for node in graph.nodes.values() if node.article_id == request.article_id)
+        current_node = skeleton.node(node.id)
+        current = None if current_node is None else next(
+            (item for item in current_node.declarations if item.name == request.declaration),
+            None,
+        )
+        if current is None:
+            # Keep selection failures under the same structured error surface
+            # as stale or malformed review evidence.
+            findings.append(_review_selection_finding(request.article_id, request.declaration))
+            continue
+        try:
+            cards.append(
+                prepare_readback(
+                    graph.blueprint_dir,
+                    article_id=request.article_id,
+                    declaration=current,
+                    model=model,
+                    text=item.testimony,
+                    packet_text=item.packet,
+                    expected_card_hash=request.expected_card_hash,
+                )
+            )
+        except ValueError as exc:
+            findings.append(ReviewFinding(request.article_id, "review-record-invalid", f"{request.declaration}: {exc}"))
+    if findings:
+        raise ReviewError(findings)
+    return cards
+
+
+def _report_recorded(written: list[tuple[Path, str]], total: int) -> None:
+    for path, declaration in written:
+        print(f"{path}: recorded read-back for {declaration}")
+    if written and len(written) < total:
+        print(
+            f"error: {len(written)} of {total} read-back(s) were filed before the failure below; "
+            "running the same record again files the rest and leaves these as they are",
+            file=sys.stderr,
+        )
 
 
 def _review_check(args: argparse.Namespace) -> int:
