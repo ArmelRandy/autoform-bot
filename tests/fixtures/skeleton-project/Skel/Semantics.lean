@@ -25,4 +25,8 @@ def notationMarker : Nat := 1
 
 def interpolationSmoke : String := s!"value {"a--b"}"
 
+def matchBody : Nat → Nat
+  | 0 => 10
+  | n + 1 => n
+
 end Skel.Semantics

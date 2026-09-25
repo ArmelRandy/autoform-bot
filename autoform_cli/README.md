@@ -320,8 +320,10 @@ each direct external assumption, and each axiom, together with the dependency
 edges, Lean version, and compiled-module identities for the transitive external
 boundary. Local source spelling and comments do not enter the semantic hash,
 while macro expansion, synthesized instance bodies, types, and definition
-bodies do. Because external modules are bound as compiled artifacts, an
-unrelated change in one of those modules may conservatively rotate the hash.
+bodies do. Compiler-generated matcher and recursor bodies stay in that hash
+even though they are folded out of the human reading list. Because external
+modules are bound as compiled artifacts, an unrelated change in one of those
+modules may conservatively rotate the hash.
 An article with several `lean:` names has one hash over all of them, printed as
 the article skeleton. The hash is how packets and reports are compared across
 builds, and testimony written about a packet can name the skeleton it was
@@ -337,7 +339,10 @@ to the cited passage and its locator.
 manifest mapping packets to articles and hashes. The destination must be empty
 or carry Autoform's packet manifest; each run replaces the complete managed
 tree, so removed declarations cannot leave stale packets behind. A concurrent
-change to the existing tree aborts publication instead of being overwritten.
+change detected before commit aborts publication instead of being overwritten.
+If the isolated old tree changes later, Autoform preserves it at a reported
+recovery path instead of deleting it.
+
 A packet holds only what a blind auditor may see: the signature, the statement
 as written, and the source of every project definition it rests on, with every
 comment and docstring removed, so that a reader who is asked what the Lean
@@ -361,6 +366,12 @@ names, because a source theorem is often formalized by several declarations
 together and each alone is honestly incomplete. A judge of faithfulness is
 given the article packet and its passage; an auditor asked what one
 declaration asserts is given that declaration's packet alone.
+
+When `--output`, `--packets`, and `--passages` are combined, all three outputs
+are staged before publication and a failed commit restores the previous set.
+This is failure atomicity, not simultaneous visibility across paths: each
+rename is atomic, but a reader opening several outputs during publication can
+briefly observe different generations.
 
 Plan durable article identity metadata without changing the blueprint:
 

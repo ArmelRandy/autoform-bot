@@ -26,6 +26,7 @@ from .skeleton import (
     extract_skeletons,
     format_report,
     write_packets,
+    write_skeleton_report,
 )
 
 
@@ -342,7 +343,7 @@ def _skeleton(args: argparse.Namespace) -> int:
         print("error: --passages requires --packets", file=sys.stderr)
         return 2
     if args.output is not None and args.packets is not None:
-        output = args.output.expanduser().resolve()
+        output = Path(os.path.abspath(args.output.expanduser()))
         packet_outputs = [args.packets.expanduser().resolve()]
         if args.passages is not None:
             packet_outputs.append(args.passages.expanduser().resolve())
@@ -363,9 +364,19 @@ def _skeleton(args: argparse.Namespace) -> int:
             print(f"error: {issue}", file=sys.stderr)
         return 2
 
-    if args.packets is not None:
+    if args.packets is not None and not report.clean:
+        print(
+            "error: refusing to publish review packets from an incomplete skeleton report",
+            file=sys.stderr,
+        )
+    elif args.packets is not None:
         try:
-            written = write_packets(report, args.packets, passages=args.passages)
+            written = write_packets(
+                report,
+                args.packets,
+                passages=args.passages,
+                report_path=args.output,
+            )
         except SkeletonError as exc:
             for issue in exc.issues:
                 print(f"error: {issue}", file=sys.stderr)
@@ -375,9 +386,14 @@ def _skeleton(args: argparse.Namespace) -> int:
         if args.passages is not None:
             cited = sum(1 for node in report.nodes if node.passage is not None)
             print(f"{args.passages}: {cited} source passage(s) written", file=stream)
+    if args.output is not None and (args.packets is None or not report.clean):
+        try:
+            write_skeleton_report(report, args.output)
+        except SkeletonError as exc:
+            for issue in exc.issues:
+                print(f"error: {issue}", file=sys.stderr)
+            return 2
     if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(report.to_json() + "\n", encoding="utf-8")
         declarations = sum(len(node.declarations) for node in report.nodes)
         stream = sys.stderr if args.json else sys.stdout
         print(

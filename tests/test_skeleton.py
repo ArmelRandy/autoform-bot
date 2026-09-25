@@ -6,11 +6,13 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import psutil
 
 from autoform_cli.__main__ import main
 from autoform_cli.skeleton import (
@@ -19,6 +21,11 @@ from autoform_cli.skeleton import (
     SKELETON_SCHEMA,
     SkeletonReport,
     SkeletonError,
+    _install_output,
+    _join_readers,
+    _remove_output,
+    _rename_no_replace,
+    _run_bounded_command,
     _replace_outputs,
     _stage_output,
     _hash_module_files,
@@ -32,6 +39,7 @@ from autoform_cli.skeleton import (
     render_probe,
     run_probe,
     write_packets,
+    write_skeleton_report,
 )
 
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "skeleton-project"
@@ -85,6 +93,10 @@ def _record(root: str, **fields: object) -> str:
     return PROBE_MARKER + json.dumps({"root": root, **fields})
 
 
+def _semantic(payload: dict[str, object]) -> str:
+    return json.dumps({"generated": [], "root": payload}, separators=(",", ":"))
+
+
 def _fake_probe_output(*, include_ghost: bool = False) -> str:
     """What the probe says about the fixture, as captured from a real run."""
 
@@ -94,8 +106,8 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [5, 6],
         "signature": "Skel.Eligible {Y : Type} (S : Y → Prop) (y : Y) : Prop",
-        "semantic_schema": "autoform-lean-expr/v1",
-        "semantic": '{"type":{"sort":{"zero":null}},"value":{"bvar":0}}',
+        "semantic_schema": "autoform-lean-expr/v2",
+        "semantic": _semantic({"type": {"sort": {"zero": None}}, "value": {"bvar": 0}}),
         "depends": [],
         "source": "/-- A weak observation admits a label. -/\ndef Eligible (S : Y → Prop) (y : Y) : Prop := S y",
     }
@@ -105,8 +117,8 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [8, 10],
         "signature": "Skel.NonAmbiguous {Y : Type} (S : Y → Prop) : Prop",
-        "semantic_schema": "autoform-lean-expr/v1",
-        "semantic": '{"type":{"sort":{"zero":null}},"value":{"bvar":1}}',
+        "semantic_schema": "autoform-lean-expr/v2",
+        "semantic": _semantic({"type": {"sort": {"zero": None}}, "value": {"bvar": 1}}),
         "depends": ["Skel.Eligible"],
         "source": (
             "/-- At most one label is admitted. -/\n"
@@ -120,8 +132,8 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [15, 18],
         "signature": "Skel.Observation (Y : Type) : Type",
-        "semantic_schema": "autoform-lean-expr/v1",
-        "semantic": '{"type":{"sort":{"zero":null}},"constructors":[]}',
+        "semantic_schema": "autoform-lean-expr/v2",
+        "semantic": _semantic({"type": {"sort": {"zero": None}}, "constructors": []}),
         "depends": [],
         "source": (
             "/-- A structure, to check inductive handling. -/\n"
@@ -139,8 +151,8 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             module="Skel.Main",
             range=[14, 17],
             signature="Skel.observation_determined {Y : Type} (o : Skel.Observation Y) :\n  ∃ y, o.admits y",
-            semantic_schema="autoform-lean-expr/v1",
-            semantic='{"type":{"sort":{"zero":null}}}',
+            semantic_schema="autoform-lean-expr/v2",
+            semantic=_semantic({"type": {"sort": {"zero": None}}}),
             lean_version="4.32.2",
             source=None,
             statement_source=None,
@@ -148,10 +160,10 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             # Deliberately out of dependency order: the report must sort them.
             trusted=[non_ambiguous, observation, eligible],
             assumed=["Mathlib.Fake"],
-            assumed_semantics=[["Mathlib.Fake", '{"type":{"sort":{"zero":null}}}']],
+            assumed_semantics=[["Mathlib.Fake", _semantic({"type": {"sort": {"zero": None}}})]],
             boundary_modules=[["Mathlib.Fake", "olean", "Skel/Defs.lean"]],
             axioms=["sorryAx"],
-            axiom_semantics=[["sorryAx", '{"type":{"sort":{"zero":null}}}']],
+            axiom_semantics=[["sorryAx", _semantic({"type": {"sort": {"zero": None}}})]],
         ),
     ]
     if include_ghost:
@@ -211,13 +223,227 @@ def test_probe_refuses_stale_artifacts_before_executing_lean(tmp_path: Path, mon
         return subprocess.CompletedProcess(command, 3, stdout="target is out-of-date", stderr="")
 
     monkeypatch.setattr("autoform_cli.skeleton.shutil.which", lambda executable: "/bin/lake")
-    monkeypatch.setattr("autoform_cli.skeleton.subprocess.run", fake_run)
+    monkeypatch.setattr("autoform_cli.skeleton._run_bounded_command", fake_run)
     probe = render_probe(imports=("Skel.Main",), roots=("Skel.x",), project_roots=("Skel",))
 
     with pytest.raises(SkeletonError, match="build artifacts are stale"):
         run_probe(probe, tmp_path)
 
     assert calls == [["/bin/lake", "--rehash", "--no-build", "build", "Skel.Main"]]
+
+
+def test_bounded_command_rejects_excess_output(tmp_path: Path) -> None:
+    with pytest.raises(SkeletonError, match="1024-byte output limit"):
+        _run_bounded_command(
+            [sys.executable, "-c", "import os; os.write(1, b'x' * 4096)"],
+            cwd=tmp_path,
+            timeout=10,
+            context="test command",
+            output_limit=1024,
+        )
+
+
+def test_bounded_command_caps_stdout_and_stderr_together(tmp_path: Path) -> None:
+    program = "import os; os.write(1, b'x' * 700); os.write(2, b'y' * 700)"
+    with pytest.raises(SkeletonError, match="1024-byte output limit"):
+        _run_bounded_command(
+            [sys.executable, "-c", program],
+            cwd=tmp_path,
+            timeout=10,
+            context="test command",
+            output_limit=1024,
+        )
+
+
+def test_bounded_command_rejects_invalid_utf8(tmp_path: Path) -> None:
+    with pytest.raises(SkeletonError, match="invalid UTF-8"):
+        _run_bounded_command(
+            [sys.executable, "-c", "import os; os.write(1, b'\\xff')"],
+            cwd=tmp_path,
+            timeout=10,
+            context="test command",
+        )
+
+
+def test_bounded_command_timeout_kills_descendants(tmp_path: Path) -> None:
+    child_pid = tmp_path / "child.pid"
+    program = (
+        "import pathlib, subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid)); "
+        "time.sleep(30)"
+    )
+
+    with pytest.raises(SkeletonError, match="timed out"):
+        _run_bounded_command(
+            [sys.executable, "-c", program],
+            cwd=tmp_path,
+            timeout=2,
+            context="test command",
+        )
+
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            child = psutil.Process(pid)
+            if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"descendant process {pid} survived command timeout")
+
+
+def test_bounded_command_rejects_a_successful_parent_with_a_live_descendant(
+    tmp_path: Path,
+) -> None:
+    child_pid = tmp_path / "child.pid"
+    program = (
+        "import pathlib, subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))"
+    )
+
+    with pytest.raises(SkeletonError, match="descendant processes"):
+        _run_bounded_command(
+            [sys.executable, "-c", program],
+            cwd=tmp_path,
+            timeout=10,
+            context="test command",
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            child = psutil.Process(pid)
+            if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"descendant process {pid} survived successful parent exit")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="detached-session assertion is POSIX-specific")
+def test_bounded_command_finds_a_descendant_that_escapes_its_process_group(
+    tmp_path: Path,
+) -> None:
+    child_pid = tmp_path / "detached-child.pid"
+    child_program = (
+        "import os, pathlib, time; os.setsid(); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid())); time.sleep(30)"
+    )
+    parent_program = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_program!r}], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+    )
+
+    with pytest.raises(SkeletonError, match="descendant processes"):
+        _run_bounded_command(
+            [sys.executable, "-c", parent_program],
+            cwd=tmp_path,
+            timeout=10,
+            context="test command",
+        )
+
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            child = psutil.Process(pid)
+            if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"detached descendant process {pid} survived cleanup")
+
+
+def test_bounded_command_interruption_kills_the_process(tmp_path: Path, monkeypatch) -> None:
+    process_pid = tmp_path / "process.pid"
+    program = (
+        "import os, pathlib, time; "
+        f"pathlib.Path({str(process_pid)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    monotonic = time.monotonic
+    calls = 0
+
+    def interrupt_after_start() -> float:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return monotonic()
+        deadline = monotonic() + 5
+        while not process_pid.exists() and monotonic() < deadline:
+            time.sleep(0.01)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("autoform_cli.skeleton.time.monotonic", interrupt_after_start)
+
+    with pytest.raises(KeyboardInterrupt) as interrupted:
+        _run_bounded_command(
+            [sys.executable, "-c", program],
+            cwd=tmp_path,
+            timeout=10,
+            context="test command",
+        )
+
+    pid = int(process_pid.read_text(encoding="utf-8"))
+    deadline = monotonic() + 5
+    while psutil.pid_exists(pid) and monotonic() < deadline:
+        time.sleep(0.01)
+    assert not psutil.pid_exists(pid)
+    assert interrupted.type is KeyboardInterrupt
+
+
+def test_bounded_command_cleanup_reserves_time_and_reuses_final_deadline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    deadlines: list[float] = []
+
+    def report_stuck_readers(readers, *, deadline: float) -> bool:
+        deadlines.append(deadline)
+        _join_readers(readers, deadline=deadline)
+        return False
+
+    monkeypatch.setattr("autoform_cli.skeleton._join_readers", report_stuck_readers)
+
+    with pytest.raises(SkeletonError, match="output pipes open"):
+        _run_bounded_command(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            timeout=10,
+            context="test command",
+        )
+
+    assert len(deadlines) == 3
+    assert deadlines[0] < deadlines[1]
+    assert deadlines[1] == deadlines[2]
+
+
+def test_probe_freshness_and_execution_share_one_deadline(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "lake-manifest.json").write_text("{}\n", encoding="utf-8")
+    calls: list[float] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, stdout="probe output", stderr="")
+
+    times = iter((100.0, 101.0, 104.0))
+    monkeypatch.setattr("autoform_cli.skeleton.shutil.which", lambda executable: "/bin/lake")
+    monkeypatch.setattr("autoform_cli.skeleton._run_bounded_command", fake_run)
+    monkeypatch.setattr("autoform_cli.skeleton.time.monotonic", lambda: next(times))
+    probe = render_probe(imports=("Skel.Main",), roots=("Skel.x",), project_roots=("Skel",))
+
+    assert run_probe(probe, tmp_path, timeout=10) == "probe output"
+    assert calls == [9.0, 6.0]
 
 
 def test_probe_requires_an_existing_lake_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -261,6 +487,15 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
 
     record = _fake_found_record()
     record["semantic"] = "not JSON"
+    with pytest.raises(SkeletonError, match="invalid elaborated semantic material"):
+        parse_probe_output(PROBE_MARKER + json.dumps(record))
+
+    record = _fake_found_record()
+    semantic = json.loads(str(record["semantic"]))
+    semantic["generated"] = [
+        {"name": "ambiguous.display.name", "material": semantic["root"]}
+    ]
+    record["semantic"] = json.dumps(semantic)
     with pytest.raises(SkeletonError, match="invalid elaborated semantic material"):
         parse_probe_output(PROBE_MARKER + json.dumps(record))
 
@@ -317,6 +552,57 @@ def test_a_package_without_library_targets_is_its_own_library(tmp_path: Path) ->
 def test_a_project_without_a_lakefile_is_refused(tmp_path: Path) -> None:
     with pytest.raises(SkeletonError):
         lean_libraries(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="named pipes are POSIX-specific")
+def test_lake_configuration_snapshot_rejects_a_named_pipe_without_blocking(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / "lakefile.toml")
+
+    with pytest.raises(SkeletonError, match="not a regular file"):
+        lean_libraries(tmp_path)
+
+
+def test_lake_configuration_snapshot_uses_content_not_file_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    fstat = os.fstat
+    calls = 0
+
+    def unstable_file_identity(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        values = list(fstat(descriptor))
+        values[1] += calls
+        return os.stat_result(values)
+
+    monkeypatch.setattr("autoform_cli.skeleton.os.fstat", unstable_file_identity)
+
+    (library,) = lean_libraries(project)
+
+    assert library.name == "Skel"
+
+
+def test_lake_configuration_snapshot_rejects_content_changed_between_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    lakefile = project / "lakefile.toml"
+    open_file = os.open
+    reads = 0
+
+    def change_before_second_read(path, flags, *args):
+        nonlocal reads
+        if Path(path) == lakefile:
+            reads += 1
+            if reads == 2:
+                lakefile.write_text('name = "Changed"\n', encoding="utf-8")
+        return open_file(path, flags, *args)
+
+    monkeypatch.setattr("autoform_cli.skeleton.os.open", change_before_second_read)
+
+    with pytest.raises(SkeletonError, match="changed while it was read"):
+        lean_libraries(project)
 
 
 # --------------------------------------------------------------------------- #
@@ -418,8 +704,8 @@ def test_trusted_theorem_source_never_exposes_its_proof(tmp_path: Path) -> None:
             "module": "Skel.Defs",
             "range": [12, 13],
             "signature": "Skel.eligible_of {Y : Type} (S : Y → Prop) (y : Y) (h : S y) : Skel.Eligible S y",
-            "semantic_schema": "autoform-lean-expr/v1",
-            "semantic": '{"type":{"sort":{"zero":null}}}',
+            "semantic_schema": "autoform-lean-expr/v2",
+            "semantic": _semantic({"type": {"sort": {"zero": None}}}),
             "depends": ["Skel.Eligible"],
             "source": None,
         }
@@ -492,6 +778,79 @@ def test_default_extraction_rejects_sources_changed_during_probe(tmp_path: Path,
         extract_skeletons(blueprint, lean_root=project)
 
 
+def test_custom_runner_rejects_sources_changed_during_probe(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+
+    def changing_runner(probe: str, lean_root: Path) -> str:
+        source = lean_root / "Skel" / "Main.lean"
+        source.write_text(
+            source.read_text(encoding="utf-8") + "\n-- concurrent edit\n",
+            encoding="utf-8",
+        )
+        return _fake_probe_output()
+
+    with pytest.raises(SkeletonError, match="Lean sources changed"):
+        extract_skeletons(blueprint, lean_root=project, runner=changing_runner)
+
+
+def test_extraction_rejects_a_blueprint_changed_during_probe(tmp_path: Path, monkeypatch) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    article = blueprint / "roadmap" / "basics" / "determined.md"
+
+    def changing_probe(probe: str, lean_root: Path) -> str:
+        article.write_text(article.read_text(encoding="utf-8") + "\nChanged.\n", encoding="utf-8")
+        return _fake_probe_output()
+
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", changing_probe)
+
+    with pytest.raises(SkeletonError, match="blueprint changed"):
+        extract_skeletons(blueprint, lean_root=project)
+
+
+def test_extraction_rejects_a_passage_changed_during_probe(tmp_path: Path, monkeypatch) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    source = blueprint / "sources" / "book.tex"
+    source.parent.mkdir()
+    source.write_text("before\n", encoding="utf-8")
+    article = blueprint / "roadmap" / "basics" / "determined.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "## Depends on",
+            "## Sources\n\n- [book](../../sources/book.tex#L1-L1)\n\n## Depends on",
+        ),
+        encoding="utf-8",
+    )
+
+    def changing_probe(probe: str, lean_root: Path) -> str:
+        source.write_text("after\n", encoding="utf-8")
+        return _fake_probe_output()
+
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", changing_probe)
+
+    with pytest.raises(SkeletonError, match="source passage changed"):
+        extract_skeletons(blueprint, lean_root=project)
+
+
+def test_extraction_rejects_lake_configuration_changed_during_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+
+    def changing_probe(probe: str, lean_root: Path) -> str:
+        lakefile = lean_root / "lakefile.toml"
+        lakefile.write_text(lakefile.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+        return _fake_probe_output()
+
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", changing_probe)
+
+    with pytest.raises(SkeletonError, match="configuration changed"):
+        extract_skeletons(blueprint, lean_root=project)
+
+
 def test_node_selection_rejects_unknown_articles(tmp_path: Path) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
@@ -561,7 +920,7 @@ def test_report_loader_rejects_mismatched_hashes_and_trust_identities(tmp_path: 
     payload = report.as_dict()
     trusted = payload["nodes"][0]["declarations"][0]["trusted"][0]
     trusted["kind"] = "theorem"
-    trusted["semantic"] = '{"type":{"sort":{"zero":null}}}'
+    trusted["semantic"] = _semantic({"type": {"sort": {"zero": None}}})
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(SkeletonError, match="proof-bearing source is forbidden"):
         load_skeleton_report(path)
@@ -617,6 +976,24 @@ def test_cli_reports_extraction_failures_on_stderr(tmp_path: Path, capsys) -> No
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.startswith("error: no lakefile.toml or lakefile.lean in ")
+
+
+def test_cli_reports_an_invalid_report_output_without_a_traceback(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", lambda probe, root: _fake_probe_output())
+    output = tmp_path / "skeleton.json"
+    output.mkdir()
+
+    assert main(
+        ["skeleton", str(blueprint), "--lean-root", str(project), "--output", str(output)]
+    ) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "report output exists and is not a regular file" in captured.err
 
 
 def test_cli_keeps_json_stdout_machine_readable_with_packets(
@@ -705,6 +1082,265 @@ def test_cli_rejects_a_report_path_inside_the_packet_tree(tmp_path: Path, capsys
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "error: --output must be disjoint from packet and passage directories\n"
+
+
+def test_cli_publishes_report_and_packet_trees_together(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", lambda probe, root: _fake_probe_output())
+    packets = tmp_path / "packets"
+    passages = tmp_path / "passages"
+    output = tmp_path / "skeleton.json"
+    output.write_text("old report\n", encoding="utf-8")
+
+    result = main(
+        [
+            "skeleton",
+            str(blueprint),
+            "--lean-root",
+            str(project),
+            "--packets",
+            str(packets),
+            "--passages",
+            str(passages),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 0
+    assert (packets / PACKET_MANIFEST).is_file()
+    assert (passages / PACKET_MANIFEST).is_file()
+    assert load_skeleton_report(output).clean
+    assert list(tmp_path.glob(".*.autoform-*")) == []
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_does_not_publish_packets_when_report_staging_fails(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", lambda probe, root: _fake_probe_output())
+    packets = tmp_path / "packets"
+    passages = tmp_path / "passages"
+    output = tmp_path / "skeleton.json"
+
+    def fail_report_stage(report: SkeletonReport, destination: Path):
+        raise OSError("simulated report staging failure")
+
+    monkeypatch.setattr("autoform_cli.skeleton._stage_report_output", fail_report_stage)
+
+    result = main(
+        [
+            "skeleton",
+            str(blueprint),
+            "--lean-root",
+            str(project),
+            "--packets",
+            str(packets),
+            "--passages",
+            str(passages),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert not packets.exists()
+    assert not passages.exists()
+    assert not output.exists()
+    assert list(tmp_path.glob(".*.autoform-stage-*")) == []
+    assert "simulated report staging failure" in capsys.readouterr().err
+
+
+def test_cli_rolls_back_packet_trees_when_report_commit_fails(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", lambda probe, root: _fake_probe_output())
+    packets = tmp_path / "packets"
+    passages = tmp_path / "passages"
+    output = tmp_path / "skeleton.json"
+    install_output = _install_output
+
+    def fail_report_install(source: str | Path, destination: str | Path) -> None:
+        source_path = Path(source)
+        if "autoform-stage" in source_path.name and Path(destination) == output:
+            raise OSError("simulated report commit failure")
+        install_output(source_path, Path(destination))
+
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", fail_report_install)
+
+    result = main(
+        [
+            "skeleton",
+            str(blueprint),
+            "--lean-root",
+            str(project),
+            "--packets",
+            str(packets),
+            "--passages",
+            str(passages),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert not packets.exists()
+    assert not passages.exists()
+    assert not output.exists()
+    assert list(tmp_path.glob(".*.autoform-*")) == []
+    assert "simulated report commit failure" in capsys.readouterr().err
+
+
+def test_cli_rolls_back_packet_trees_and_report_when_interrupted_after_report_install(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", lambda probe, root: _fake_probe_output())
+    packets = tmp_path / "packets"
+    passages = tmp_path / "passages"
+    output = tmp_path / "skeleton.json"
+    output.write_text("old report\n", encoding="utf-8")
+    report = extract_skeletons(
+        blueprint,
+        lean_root=project,
+        runner=lambda probe, root: _fake_probe_output(),
+    )
+    write_packets(report, packets, passages=passages)
+    (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
+    (passages / "old-marker").write_text("old passages\n", encoding="utf-8")
+    install_output = _install_output
+
+    def interrupt_after_report_install(source: str | Path, destination: str | Path) -> None:
+        install_output(Path(source), Path(destination))
+        if "autoform-stage" in Path(source).name and Path(destination) == output:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "autoform_cli.skeleton._install_output", interrupt_after_report_install
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        main(
+            [
+                "skeleton",
+                str(blueprint),
+                "--lean-root",
+                str(project),
+                "--packets",
+                str(packets),
+                "--passages",
+                str(passages),
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert (packets / "old-marker").read_text(encoding="utf-8") == "old packets\n"
+    assert (passages / "old-marker").read_text(encoding="utf-8") == "old passages\n"
+    assert output.read_text(encoding="utf-8") == "old report\n"
+    assert list(tmp_path.glob(".*.autoform-*")) == []
+
+
+def test_report_publication_preserves_a_concurrent_replacement_before_install(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(
+        blueprint,
+        lean_root=project,
+        runner=lambda probe, root: _fake_probe_output(),
+    )
+    output = tmp_path / "skeleton.json"
+    output.write_text("old report\n", encoding="utf-8")
+    install_output = _install_output
+
+    def replace_before_install(stage: Path, destination: Path) -> None:
+        if destination == output:
+            output.write_text("concurrent report\n", encoding="utf-8")
+        install_output(stage, destination)
+
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", replace_before_install)
+
+    with pytest.raises(SkeletonError, match="published output changed during rollback"):
+        write_skeleton_report(report, output)
+
+    assert output.read_text(encoding="utf-8") == "concurrent report\n"
+    backups = list(tmp_path.glob(".skeleton.json.autoform-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "old report\n"
+
+
+def test_report_publication_rolls_back_when_interrupted_after_exclusive_link(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(
+        blueprint,
+        lean_root=project,
+        runner=lambda probe, root: _fake_probe_output(),
+    )
+    output = tmp_path / "skeleton.json"
+    output.write_text("old report\n", encoding="utf-8")
+    link = os.link
+
+    def interrupt_after_link(source: str | Path, destination: str | Path) -> None:
+        link(source, destination)
+        if "autoform-stage" in Path(source).name and Path(destination) == output:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("autoform_cli.skeleton.os.link", interrupt_after_link)
+
+    with pytest.raises(KeyboardInterrupt):
+        write_skeleton_report(report, output)
+
+    assert output.read_text(encoding="utf-8") == "old report\n"
+    assert list(tmp_path.glob(".*.autoform-*")) == []
+
+
+def test_cli_refuses_a_symlink_report_without_publishing_packets(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", lambda probe, root: _fake_probe_output())
+    packets = tmp_path / "packets"
+    passages = tmp_path / "passages"
+    report_target = tmp_path / "report-target.json"
+    report_target.write_text("keep me\n", encoding="utf-8")
+    output = tmp_path / "skeleton.json"
+    output.symlink_to(report_target)
+
+    result = main(
+        [
+            "skeleton",
+            str(blueprint),
+            "--lean-root",
+            str(project),
+            "--packets",
+            str(packets),
+            "--passages",
+            str(passages),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert not packets.exists()
+    assert not passages.exists()
+    assert output.is_symlink()
+    assert report_target.read_text(encoding="utf-8") == "keep me\n"
+    assert "refusing symlink report output" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #
@@ -801,6 +1437,7 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
 
     roots = (
         "Skel.Semantics.expandedMacro",
+        "Skel.Semantics.matchBody",
         "Skel.Semantics.usesOpaque",
         "Skel.Semantics.selectedProposition",
         "Skel.Semantics.usesQuoted",
@@ -817,8 +1454,8 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
 
     before = records()
     macro = before["Skel.Semantics.expandedMacro"]
-    assert macro["semantic_schema"] == "autoform-lean-expr/v1"
-    assert set(json.loads(str(macro["semantic"]))) == {"type", "value"}
+    assert macro["semantic_schema"] == "autoform-lean-expr/v2"
+    assert set(json.loads(str(macro["semantic"]))["root"]) == {"type", "value"}
 
     opaque = before["Skel.Semantics.usesOpaque"]
     assert [item["name"] for item in opaque["trusted"]] == [
@@ -826,7 +1463,7 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
         "Skel.Semantics.opaqueWitness",
     ]
     opaque_item = next(item for item in opaque["trusted"] if item["name"].endswith("opaqueWitness"))
-    assert set(json.loads(opaque_item["semantic"])) == {"type", "value"}
+    assert set(json.loads(opaque_item["semantic"])["root"]) == {"type", "value"}
 
     selected = before["Skel.Semantics.selectedProposition"]
     assert selected["trusted"] == []
@@ -850,9 +1487,21 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
     quoted = before["Skel.Semantics.usesQuoted"]
     assert [item["name"] for item in quoted["trusted"]] == ["Skel.Semantics.«quoted.helper»"]
 
+    matched = before["Skel.Semantics.matchBody"]
+    assert matched["trusted"] == []
+    generated = json.loads(str(matched["semantic"]))["generated"]
+    assert len(generated) == 1
+    assert isinstance(generated[0]["name"], dict)
+
     source = project / "Skel" / "Semantics.lean"
     text = source.read_text(encoding="utf-8")
-    source.write_text(text.replace("| `(semanticMacro) => `(1)", "| `(semanticMacro) => `(2)"), encoding="utf-8")
+    source.write_text(
+        text.replace("| `(semanticMacro) => `(1)", "| `(semanticMacro) => `(2)").replace(
+            "  | 0 => 10\n  | n + 1 => n",
+            "  | 1 => 10\n  | n => n",
+        ),
+        encoding="utf-8",
+    )
     rebuild = subprocess.run(
         ["lake", "build", "Skel.Semantics"],
         cwd=project,
@@ -862,10 +1511,15 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
         check=False,
     )
     assert rebuild.returncode == 0, rebuild.stderr
-    after = records()["Skel.Semantics.expandedMacro"]
+    changed = records()
+    after = changed["Skel.Semantics.expandedMacro"]
     assert after["signature"] == macro["signature"]
     assert after["statement_source"] == macro["statement_source"]
     assert after["semantic"] != macro["semantic"]
+    changed_match = changed["Skel.Semantics.matchBody"]
+    assert changed_match["signature"] == matched["signature"]
+    assert changed_match["semantic"] != matched["semantic"]
+    assert changed_match["trusted"] == []
 
     vendor = project / "Skel" / "Vendor.lean"
     vendor.write_text(
@@ -1023,6 +1677,54 @@ def test_a_line_locator_on_a_source_file_yields_the_passage(tmp_path: Path) -> N
     assert load_skeleton_report_roundtrip(report, tmp_path)
 
 
+def test_packet_publication_refuses_an_incomplete_report(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(
+        blueprint,
+        lean_root=project,
+        runner=lambda probe, root: _fake_probe_output(),
+    )
+    incomplete = replace(report, unresolved=("missing declaration",))
+    packets = tmp_path / "packets"
+
+    with pytest.raises(SkeletonError, match="incomplete skeleton report"):
+        write_packets(incomplete, packets)
+
+    assert not packets.exists()
+
+
+def test_cli_does_not_publish_packets_for_unresolved_declarations(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(
+        tmp_path,
+        lean={"determined": "Skel.observation_determined", "missing": "Skel.absent"},
+    )
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", lambda probe, root: _fake_probe_output())
+    packets = tmp_path / "packets"
+    report_path = tmp_path / "skeleton.json"
+
+    result = main(
+        [
+            "skeleton",
+            str(blueprint),
+            "--lean-root",
+            str(project),
+            "--output",
+            str(report_path),
+            "--packets",
+            str(packets),
+        ]
+    )
+
+    assert result == 1
+    assert not packets.exists()
+    assert load_skeleton_report(report_path).unresolved
+    assert "refusing to publish review packets" in capsys.readouterr().err
+
+
 def test_packet_publication_replaces_stale_managed_output(tmp_path: Path) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
@@ -1115,21 +1817,116 @@ def test_packet_publication_rolls_back_both_trees_on_commit_failure(
     (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
     (passages / "old-marker").write_text("old passages\n", encoding="utf-8")
 
-    replace = os.replace
+    install_output = _install_output
 
     def fail_passage_install(source: str | Path, destination: str | Path) -> None:
         source_path = Path(source)
         if "autoform-stage" in source_path.name and Path(destination) == passages:
             raise OSError("simulated passage commit failure")
-        replace(source, destination)
+        install_output(source_path, Path(destination))
 
-    monkeypatch.setattr("autoform_cli.skeleton.os.replace", fail_passage_install)
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", fail_passage_install)
 
     with pytest.raises(SkeletonError, match="could not publish skeleton output"):
         write_packets(report, packets, passages=passages)
 
     assert (packets / "old-marker").read_text(encoding="utf-8") == "old packets\n"
     assert (passages / "old-marker").read_text(encoding="utf-8") == "old passages\n"
+
+
+def test_packet_publication_rolls_back_both_trees_when_interrupted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(
+        blueprint,
+        lean_root=project,
+        runner=lambda probe, root: _fake_probe_output(),
+    )
+    packets = tmp_path / "packets"
+    passages = tmp_path / "passages"
+    write_packets(report, packets, passages=passages)
+    (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
+    (passages / "old-marker").write_text("old passages\n", encoding="utf-8")
+    install_output = _install_output
+
+    def interrupt_passage_install(source: str | Path, destination: str | Path) -> None:
+        source_path = Path(source)
+        install_output(source_path, Path(destination))
+        if "autoform-stage" in source_path.name and Path(destination) == passages:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", interrupt_passage_install)
+
+    with pytest.raises(KeyboardInterrupt):
+        write_packets(report, packets, passages=passages)
+
+    assert (packets / "old-marker").read_text(encoding="utf-8") == "old packets\n"
+    assert (passages / "old-marker").read_text(encoding="utf-8") == "old passages\n"
+
+
+def test_packet_publication_rolls_back_when_interrupted_after_backup_rename(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(
+        blueprint,
+        lean_root=project,
+        runner=lambda probe, root: _fake_probe_output(),
+    )
+    packets = tmp_path / "packets"
+    write_packets(report, packets)
+    marker = packets / "old-marker"
+    marker.write_text("old packets\n", encoding="utf-8")
+    replace_path = os.replace
+
+    def interrupt_after_backup(source: str | Path, destination: str | Path) -> None:
+        replace_path(source, destination)
+        if Path(source) == packets and "autoform-backup" in Path(destination).name:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("autoform_cli.skeleton.os.replace", interrupt_after_backup)
+
+    with pytest.raises(KeyboardInterrupt):
+        write_packets(report, packets)
+
+    assert marker.read_text(encoding="utf-8") == "old packets\n"
+    assert list(tmp_path.glob(".packets.autoform-backup-*")) == []
+
+
+def test_packet_publication_preserves_a_changed_backup_during_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(
+        blueprint,
+        lean_root=project,
+        runner=lambda probe, root: _fake_probe_output(),
+    )
+    packets = tmp_path / "packets"
+    write_packets(report, packets)
+    (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
+    install_output = _install_output
+    changed_backup: Path | None = None
+
+    def change_backup_after_install(source: str | Path, destination: str | Path) -> None:
+        nonlocal changed_backup
+        install_output(Path(source), Path(destination))
+        if "autoform-stage" in Path(source).name and Path(destination) == packets:
+            (changed_backup,) = tmp_path.glob(".packets.autoform-backup-*")
+            (changed_backup / "concurrent-marker").write_text("keep me\n", encoding="utf-8")
+
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", change_backup_after_install)
+
+    with pytest.warns(RuntimeWarning, match="backup changed.*preserved"):
+        write_packets(report, packets)
+
+    assert changed_backup is not None
+    assert (changed_backup / "concurrent-marker").read_text(encoding="utf-8") == "keep me\n"
+    assert not (packets / "old-marker").exists()
 
 
 def test_packet_publication_does_not_delete_a_concurrent_replacement(
@@ -1143,6 +1940,7 @@ def test_packet_publication_does_not_delete_a_concurrent_replacement(
     write_packets(report, packets, passages=passages)
     (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
     replace = os.replace
+    install_output = _install_output
 
     def replace_then_fail(source: str | Path, destination: str | Path) -> None:
         source_path = Path(source)
@@ -1153,14 +1951,178 @@ def test_packet_publication_does_not_delete_a_concurrent_replacement(
             packets.mkdir()
             (packets / "valuable").write_text("concurrent publisher\n", encoding="utf-8")
             raise OSError("simulated passage commit failure")
-        replace(source, destination)
+        install_output(source_path, destination_path)
 
-    monkeypatch.setattr("autoform_cli.skeleton.os.replace", replace_then_fail)
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", replace_then_fail)
 
     with pytest.raises(SkeletonError, match="preserved"):
         write_packets(report, packets, passages=passages)
 
     assert (packets / "valuable").read_text(encoding="utf-8") == "concurrent publisher\n"
+    backups = list(tmp_path.glob(".packets.autoform-backup-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "old-marker").read_text(encoding="utf-8") == "old packets\n"
+
+
+def test_packet_publication_does_not_replace_a_concurrent_empty_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    packets = tmp_path / "packets"
+    write_packets(report, packets)
+    (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
+    install_output = _install_output
+    concurrent_inode: int | None = None
+
+    def create_before_install(stage: Path, destination: Path) -> None:
+        nonlocal concurrent_inode
+        if destination == packets:
+            destination.mkdir()
+            concurrent_inode = destination.stat().st_ino
+        install_output(stage, destination)
+
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", create_before_install)
+
+    with pytest.raises(SkeletonError, match="published output changed during rollback"):
+        write_packets(report, packets)
+
+    assert concurrent_inode is not None
+    assert packets.stat().st_ino == concurrent_inode
+    assert list(packets.iterdir()) == []
+    backups = list(tmp_path.glob(".packets.autoform-backup-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "old-marker").read_text(encoding="utf-8") == "old packets\n"
+
+
+def test_packet_publication_preflights_no_replace_before_moving_old_tree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    packets = tmp_path / "packets"
+    write_packets(report, packets)
+    marker = packets / "old-marker"
+    marker.write_text("old packets\n", encoding="utf-8")
+
+    def unavailable(source: Path, destination: Path) -> None:
+        raise SkeletonError(["atomic no-replace rename is unavailable"])
+
+    monkeypatch.setattr("autoform_cli.skeleton._rename_no_replace", unavailable)
+
+    with pytest.raises(SkeletonError, match="no-replace rename is unavailable"):
+        write_packets(report, packets)
+
+    assert marker.read_text(encoding="utf-8") == "old packets\n"
+    assert list(tmp_path.glob(".packets.autoform-backup-*")) == []
+    assert list(tmp_path.glob(".packets.autoform-preflight-*")) == []
+
+
+def test_packet_publication_cleans_up_an_interrupted_preflight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    packets = tmp_path / "packets"
+    write_packets(report, packets)
+    marker = packets / "old-marker"
+    marker.write_text("old packets\n", encoding="utf-8")
+    install_output = _install_output
+
+    def interrupt_after_preflight_install(stage: Path, destination: Path) -> None:
+        install_output(stage, destination)
+        if "autoform-preflight" in destination.parent.name:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "autoform_cli.skeleton._install_output", interrupt_after_preflight_install
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        write_packets(report, packets)
+
+    assert marker.read_text(encoding="utf-8") == "old packets\n"
+    assert list(tmp_path.glob(".packets.autoform-backup-*")) == []
+    assert list(tmp_path.glob(".packets.autoform-preflight-*")) == []
+
+
+def test_packet_publication_restores_old_trees_when_quarantine_cleanup_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    packets = tmp_path / "packets"
+    passages = tmp_path / "passages"
+    write_packets(report, packets, passages=passages)
+    (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
+    (passages / "old-marker").write_text("old passages\n", encoding="utf-8")
+    install_output = _install_output
+    remove_output = _remove_output
+
+    def fail_passage_install(stage: Path, destination: Path) -> None:
+        if "autoform-stage" in stage.name and destination == passages:
+            raise OSError("simulated passage install failure")
+        install_output(stage, destination)
+
+    def fail_quarantine_cleanup(path: Path) -> None:
+        if "autoform-rollback" in path.name:
+            raise OSError("simulated quarantine cleanup failure")
+        remove_output(path)
+
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", fail_passage_install)
+    monkeypatch.setattr("autoform_cli.skeleton._remove_output", fail_quarantine_cleanup)
+
+    with pytest.raises(SkeletonError, match="preserved for recovery"):
+        write_packets(report, packets, passages=passages)
+
+    assert (packets / "old-marker").read_text(encoding="utf-8") == "old packets\n"
+    assert (passages / "old-marker").read_text(encoding="utf-8") == "old passages\n"
+    quarantines = list(tmp_path.glob(".packets.autoform-rollback-*"))
+    assert len(quarantines) == 1
+    assert (quarantines[0] / PACKET_MANIFEST).is_file()
+
+
+def test_packet_publication_does_not_overwrite_during_backup_restore(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    packets = tmp_path / "packets"
+    passages = tmp_path / "passages"
+    write_packets(report, packets, passages=passages)
+    (packets / "old-marker").write_text("old packets\n", encoding="utf-8")
+    (passages / "old-marker").write_text("old passages\n", encoding="utf-8")
+    install_output = _install_output
+    rename_no_replace = _rename_no_replace
+    concurrent_inode: int | None = None
+
+    def fail_passage_install(stage: Path, destination: Path) -> None:
+        if "autoform-stage" in stage.name and destination == passages:
+            raise OSError("simulated passage install failure")
+        install_output(stage, destination)
+
+    def create_before_restore(source: Path, destination: Path) -> None:
+        nonlocal concurrent_inode
+        if destination == packets and "autoform-backup" in source.name:
+            destination.mkdir()
+            concurrent_inode = destination.stat().st_ino
+        rename_no_replace(source, destination)
+
+    monkeypatch.setattr("autoform_cli.skeleton._install_output", fail_passage_install)
+    monkeypatch.setattr("autoform_cli.skeleton._rename_no_replace", create_before_restore)
+
+    with pytest.raises(SkeletonError, match="could not restore skeleton output"):
+        write_packets(report, packets, passages=passages)
+
+    assert concurrent_inode is not None
+    assert packets.stat().st_ino == concurrent_inode
+    assert list(packets.iterdir()) == []
+    assert (passages / "old-marker").read_text(encoding="utf-8") == "old passages\n"
     backups = list(tmp_path.glob(".packets.autoform-backup-*"))
     assert len(backups) == 1
     assert (backups[0] / "old-marker").read_text(encoding="utf-8") == "old packets\n"
