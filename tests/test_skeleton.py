@@ -387,7 +387,7 @@ def test_bounded_command_interruption_kills_the_process(tmp_path: Path, monkeypa
 
     monkeypatch.setattr("autoform_cli.skeleton.time.monotonic", interrupt_after_start)
 
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(KeyboardInterrupt) as interrupted:
         _run_bounded_command(
             [sys.executable, "-c", program],
             cwd=tmp_path,
@@ -396,7 +396,11 @@ def test_bounded_command_interruption_kills_the_process(tmp_path: Path, monkeypa
         )
 
     pid = int(process_pid.read_text(encoding="utf-8"))
+    deadline = monotonic() + 5
+    while psutil.pid_exists(pid) and monotonic() < deadline:
+        time.sleep(0.01)
     assert not psutil.pid_exists(pid)
+    assert interrupted.type is KeyboardInterrupt
 
 
 def test_bounded_command_cleanup_reserves_time_and_reuses_final_deadline(

@@ -731,11 +731,13 @@ def _remember_descendants(
 def _remember_tagged_processes(
     token: str,
     descendants: dict[tuple[int, float], psutil.Process],
+    *,
+    root_pid: int,
 ) -> None:
     """Find descendants that escaped the original parent and process group."""
 
     for candidate in psutil.process_iter():
-        if candidate.pid == os.getpid():
+        if candidate.pid in {os.getpid(), root_pid}:
             continue
         try:
             if candidate.environ().get(_PROCESS_TOKEN_ENV) == token:
@@ -785,8 +787,12 @@ def _terminate_process_tree(
     """Best-effort termination of a command and every descendant observed."""
 
     _remember_descendants(process, descendants)
-    _remember_tagged_processes(token, descendants)
-    children = [child for child in descendants.values() if _process_is_alive(child)]
+    _remember_tagged_processes(token, descendants, root_pid=process.pid)
+    children = [
+        child
+        for child in descendants.values()
+        if child.pid != process.pid and _process_is_alive(child)
+    ]
     phase_start = time.perf_counter()
     available = _remaining(deadline)
     process_deadline = phase_start + available * 0.8
@@ -797,15 +803,15 @@ def _terminate_process_tree(
         except (ProcessLookupError, PermissionError, OSError):
             pass
     else:  # pragma: no cover - Windows-specific best effort
-        for child in reversed(children):
-            try:
-                child.terminate()
-            except psutil.Error:
-                pass
         if process.poll() is None:
             try:
                 process.terminate()
             except OSError:
+                pass
+        for child in reversed(children):
+            try:
+                child.terminate()
+            except psutil.Error:
                 pass
 
     if process.poll() is None:
@@ -824,7 +830,7 @@ def _terminate_process_tree(
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
-    _remember_tagged_processes(token, descendants)
+    _remember_tagged_processes(token, descendants, root_pid=process.pid)
     for child in descendants.values():
         if _process_is_alive(child):
             try:
@@ -947,7 +953,7 @@ def _run_bounded_command(
                 break
             overflow.wait(min(0.05, remaining))
         _remember_descendants(process, descendants)
-        _remember_tagged_processes(token, descendants)
+        _remember_tagged_processes(token, descendants, root_pid=process.pid)
         live_descendants = any(
             _process_is_alive(descendant) for descendant in descendants.values()
         )
@@ -1006,14 +1012,19 @@ def _run_bounded_command(
         _join_readers(readers, deadline=cleanup_deadline)
         raise
     finally:
-        if process is not None:
-            for index, stream in enumerate((process.stdout, process.stderr)):
-                if stream is None:
-                    continue
-                if index < len(readers) and readers[index].is_alive():
-                    continue
-                else:
-                    stream.close()
+        try:
+            if process is not None:
+                for index, stream in enumerate((process.stdout, process.stderr)):
+                    if stream is None:
+                        continue
+                    if index < len(readers) and readers[index].is_alive():
+                        continue
+                    else:
+                        stream.close()
+        finally:
+            # A re-raised exception retains this frame.  Drop Popen so its
+            # Windows process handle does not keep an exited PID allocated.
+            process = None
 
 
 # --------------------------------------------------------------------------- #
