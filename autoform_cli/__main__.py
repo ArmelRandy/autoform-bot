@@ -197,7 +197,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     review_check.add_argument("blueprint_dir")
     review_check.add_argument("--lean-root", type=Path, required=True)
-    review_check.add_argument("--bundle", type=Path, required=True)
+    review_check.add_argument(
+        "--bundle",
+        type=Path,
+        help="the bundle `review prepare` wrote; without it, one is derived from this run's own extraction",
+    )
     review_check.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
     render = subparsers.add_parser("render", help="build the publishable blueprint")
@@ -211,10 +215,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="fail when a 'lean:' declaration is not found in the Lean sources",
     )
-    render.add_argument(
+    render_review = render.add_mutually_exclusive_group()
+    render_review.add_argument(
         "--review-bundle",
         type=Path,
         help="prepared current-tree review evidence; adds validated review disclosures",
+    )
+    render_review.add_argument(
+        "--review",
+        action="store_true",
+        help="add review disclosures from evidence derived in this run, without a prepared bundle",
     )
 
     args = parser.parse_args(argv)
@@ -833,11 +843,20 @@ def _current_review(
     blueprint_dir: str | Path,
     *,
     lean_root: Path,
-    bundle_path: Path,
+    bundle_path: Path | None,
 ):
+    """The graph, one extraction, and a review bundle validated against both.
+
+    With ``bundle_path`` the bundle is the one ``review prepare`` wrote, and it
+    must still describe the current tree. Without it, the bundle is derived
+    from this same extraction. CI wants the latter: it never trusts a committed
+    bundle, and preparing one in a separate command would pay for a second
+    extraction of the same unchanged checkout.
+    """
+
     graph = load_graph(blueprint_dir)
     skeleton = extract_skeletons(blueprint_dir, lean_root=lean_root)
-    bundle = load_review_bundle(bundle_path)
+    bundle = build_review_bundle(graph, skeleton) if bundle_path is None else load_review_bundle(bundle_path)
     findings = validate_review_bundle(graph, bundle, skeleton)
     if findings:
         raise ReviewError(findings)
@@ -885,9 +904,10 @@ def _render(args: argparse.Namespace) -> int:
     try:
         skeleton = None
         bundle = None
-        if args.review_bundle is not None:
+        if args.review_bundle is not None or args.review:
             if args.lean_root is None:
-                print("error: --review-bundle requires --lean-root", file=sys.stderr)
+                flag = "--review" if args.review else "--review-bundle"
+                print(f"error: {flag} requires --lean-root", file=sys.stderr)
                 return 2
             _, skeleton, bundle = _current_review(
                 args.blueprint_dir,

@@ -287,9 +287,9 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "autoform check blueprint --lean-root ." in workflow
     assert "autoform render blueprint" in workflow
     assert "--require-declarations" in workflow
-    assert "autoform review prepare blueprint --lean-root ." in workflow
-    assert "autoform review check blueprint --lean-root ." in workflow
-    assert "--review-bundle" in workflow
+    assert "autoform review check blueprint --lean-root .\n" in workflow
+    assert "review prepare" not in workflow
+    assert "review_args=(--review)" in workflow
     assert "--with markdown==3.10.3" in workflow
     assert "--with pymdown-extensions==10.21.3" in workflow
     assert "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128" in workflow
@@ -302,8 +302,8 @@ def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> No
     assert "Reject kernel-check bypass options" in verify
     assert "Audit every root-package declaration" in verify
     assert "python3 .github/autoform_audit.py" in verify
-    assert "autoform review prepare blueprint --lean-root ." in verify
-    assert "autoform review check blueprint --lean-root ." in verify
+    assert "autoform review check blueprint --lean-root .\n" in verify
+    assert "review prepare" not in verify
     assert "lake pack" in verify
     assert "lake-modules" not in verify
     assert "contains no ILean artifacts" in (

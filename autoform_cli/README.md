@@ -404,6 +404,8 @@ autoform review record blueprint --lean-root . --bundle review.json \
 autoform review check blueprint --lean-root . --bundle review.json
 autoform audit blueprint --lean-root . --review-bundle review.json
 autoform render blueprint --lean-root . --review-bundle review.json
+autoform review check blueprint --lean-root .
+autoform render blueprint --lean-root . --review
 ```
 
 `review prepare` extracts Lean evidence from the current built tree and writes
@@ -452,14 +454,17 @@ bundles. `review check` also requires complete current cards and matching human
 approvals. The rendered review disclosure uses the same packet bytes that were
 hashed, never a reconstructed or comment-bearing approximation. Read-back
 cards are absorbed into their article and are not published as standalone
-pages.
+pages. Without `--bundle`, `review check` derives the bundle from its own
+extraction, and `render --review` does the same: each extracts the tree once
+instead of once to prepare and again to check.
 
 Newly scaffolded projects commit the versioned `.autoform-review` policy marker,
 so generated CI enforces this gate from the first formalized statement. Older
 projects opt in by adding that marker; cards or `review_approved` assertions
-without it fail instead of silently disabling review. CI prepares a fresh
-temporary bundle after the Lean build and runs the review-only check, without
-turning advisory roadmap or coverage findings into merge blockers.
+without it fail instead of silently disabling review. CI never trusts a
+committed bundle: after the Lean build it runs the review-only check against
+one derived in the same run, and Pages renders its review disclosures the same
+way, without turning advisory roadmap or coverage findings into merge blockers.
 
 Plan durable article identity metadata without changing the blueprint:
 

@@ -184,6 +184,77 @@ def test_review_cli_prepares_records_and_checks_exact_evidence(
     assert "OK: statement reviews match" in capsys.readouterr().out
 
 
+def test_check_and_render_derive_the_bundle_from_their_own_extraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """What CI runs: no prepared bundle, and one extraction per command."""
+
+    blueprint = _blueprint(tmp_path)
+    skeleton = _skeleton()
+    extraction_scopes: list[object] = []
+
+    def extract(*args: object, **kwargs: object) -> SkeletonReport:
+        extraction_scopes.append(kwargs.get("node_ids"))
+        return skeleton
+
+    monkeypatch.setattr("autoform_cli.__main__.extract_skeletons", extract)
+    bundle_path = tmp_path / "review.json"
+    packets = tmp_path / "packets"
+    assert main(
+        ["review", "prepare", str(blueprint), "--lean-root", str(tmp_path), "--output", str(bundle_path),
+         "--packets", str(packets)]
+    ) == 0
+    packet = packets / json.loads((packets / "manifest.json").read_text(encoding="utf-8"))["packets"][0]["packet"]
+    testimony = tmp_path / "testimony.md"
+    testimony.write_text("For the unique proposition, the proposition is true.\n", encoding="utf-8")
+    assert main(
+        ["review", "record", str(blueprint), "--lean-root", str(tmp_path), "--bundle", str(bundle_path),
+         "--article-id", "af_0123456789abcdef01234567", "--declaration", "Review.result",
+         "--packet", str(packet), "--testimony", str(testimony), "--model", "test-model"]
+    ) == 0
+    capsys.readouterr()
+    extraction_scopes.clear()
+
+    check = ["review", "check", str(blueprint), "--lean-root", str(tmp_path)]
+    assert main(check) == 1
+    assert "review-unapproved" in capsys.readouterr().out
+    assert extraction_scopes == [None]
+
+    # The derived bundle is the prepared one: an approval of either holds for both.
+    approval = load_review_bundle(bundle_path).review_hash("af_0123456789abcdef01234567", load_readbacks(blueprint))
+    article = blueprint / "roadmap/basics/result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "statement: formalized\n", f"statement: formalized\nreview_approved: {approval}\n"
+        ),
+        encoding="utf-8",
+    )
+    assert main(check) == 0
+    assert "OK: statement reviews match" in capsys.readouterr().out
+    assert extraction_scopes == [None, None]
+
+    site = tmp_path / "site"
+    assert main(["render", str(blueprint), "--lean-root", str(tmp_path), "--review", "--output", str(site)]) == 0
+    assert extraction_scopes == [None, None, None]
+    pages = "\n".join(path.read_text(encoding="utf-8") for path in site.rglob("*.md"))
+    assert "For the unique proposition, the proposition is true." in pages
+    assert "bp-readback-current" in pages
+
+
+def test_render_takes_one_source_of_review_evidence(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    blueprint = _blueprint(tmp_path)
+
+    with pytest.raises(SystemExit) as refused:
+        main(["render", str(blueprint), "--review", "--review-bundle", str(tmp_path / "review.json")])
+    assert refused.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+    assert main(["render", str(blueprint), "--review", "--output", str(tmp_path / "site")]) == 2
+    assert "--review requires --lean-root" in capsys.readouterr().err
+
+
 def test_review_record_rejects_packet_bytes_that_differ_from_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

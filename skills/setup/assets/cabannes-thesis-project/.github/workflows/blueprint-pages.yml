@@ -88,15 +88,12 @@ jobs:
           lake exe cache get || echo "no cache available; building from source"
           lake build
 
-      - name: Prepare and verify statement reviews
+      # Without --bundle the check derives the bundle from its own extraction.
+      - name: Verify statement reviews
         if: env.AUTOFORM_REVIEW_ENABLED == 'true'
-        run: |
-          set -euo pipefail
-          bundle="${RUNNER_TEMP}/autoform-review.json"
-          uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}" \
-            autoform review prepare blueprint --lean-root . --output "$bundle"
-          uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}" \
-            autoform review check blueprint --lean-root . --bundle "$bundle"
+        run: >-
+          uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"
+          autoform review check blueprint --lean-root .
 
       # Writes site-src/: statement boxes, derived statuses, the Mermaid graph,
       # and permalinks into the Lean code at this exact commit.
@@ -104,8 +101,8 @@ jobs:
         run: |
           set -euo pipefail
           review_args=()
-          if [[ -f "${RUNNER_TEMP}/autoform-review.json" ]]; then
-            review_args=(--review-bundle "${RUNNER_TEMP}/autoform-review.json")
+          if [[ "${AUTOFORM_REVIEW_ENABLED:-}" == true ]]; then
+            review_args=(--review)
           fi
           uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}" \
             autoform render blueprint \
