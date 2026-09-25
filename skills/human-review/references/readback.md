@@ -58,6 +58,13 @@ definitions, visibility-changing attributes, and Mermaid blocks are rejected whe
 the testimony. They add no mathematical content and would let generated prose
 run code or fetch remote resources in the published review site.
 
+Everything you write must be visible as written. Do not use invisible
+characters such as zero-width spaces, and in formulas do not use `\phantom`,
+overlapping or spacing commands such as `\rlap` and `\kern`, macro definitions,
+or `%`; write `\%` for a percent sign. A read-back that breaks this is
+rejected, however faithful it is. Keep it to a few kilobytes: a read-back over
+32 KiB is refused unread.
+
 ## Return only testimony
 
 Return only the Markdown testimony described above. Do not create a vault

@@ -29,6 +29,7 @@ import os
 import re
 import secrets
 import stat
+import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -54,6 +55,60 @@ _UNSAFE_TEX_COMMAND = re.compile(
     r"\\(?:require|href|style|class|cssId|htmlId|htmlClass|htmlStyle|url|csname|"
     r"color|definecolor|textcolor|colorbox|fcolorbox)\b"
 )
+
+#: TeX that keeps part of a formula from being seen as written: it hides
+#: content (``\phantom``), draws symbols over one another or moves them
+#: (``\llap``, ``\kern``), shows one of several alternatives (``\toggle``),
+#: sets glyphs or colours through attributes (``\bbox``, ``\unicode``), or
+#: defines macros whose bodies can drop their arguments (``\newcommand``).
+_HIDING_TEX_COMMAND = re.compile(
+    r"\\(?:phantom|hphantom|vphantom|smash|llap|rlap|clap|mathllap|mathrlap|mathclap|"
+    r"kern|mkern|hskip|mskip|hspace|mspace|moveleft|moveright|raise|lower|"
+    r"toggle|mathtip|texttip|actiontype|bbox|enclose|mmlToken|unicode|data|"
+    r"def|gdef|edef|xdef|let|futurelet|newcommand|renewcommand|providecommand|"
+    r"newenvironment|renewenvironment|DeclareMathOperator)(?![A-Za-z])"
+)
+#: Negative spaces in a row slide a symbol back over the one before it.
+_STACKED_NEGATIVE_SPACE = re.compile(
+    r"(?:\\(?:!|negthinspace|negmedspace|negthickspace)(?![A-Za-z])\s*){2,}"
+)
+#: A ``%`` after an even number of backslashes starts a TeX comment, which
+#: silently drops the rest of its line from the typeset formula.
+_TEX_COMMENT = re.compile(r"(?<!\\)(?:\\\\)*%")
+
+#: Characters that render as nothing, or reorder the text around them, so a
+#: card could say more or other than a reader sees. Unicode's general
+#: categories catch most (controls, format characters such as zero-width
+#: spaces and bidirectional overrides, separators, private-use and unassigned
+#: code points); the rest are default-ignorable or blank letters and symbols.
+_HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Co", "Cn", "Cs", "Zl", "Zp"})
+_HIDDEN_CODE_POINTS = frozenset(
+    {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180C, 0x180D, 0x180F, 0x2800, 0x3164, 0xFFA0}
+    | set(range(0xFE00, 0xFE10))
+    | set(range(0xE0100, 0xE01F0))
+)
+_ALLOWED_CONTROLS = frozenset("\t\n\r")
+
+#: Limits a testimony must meet before the Markdown renderer reads it. Python-
+#: Markdown's inline processing is superlinear in the number of spans and of
+#: unmatched openers, cubic in a run of backticks, and recursive in nesting
+#: depth, so a byte limit alone does not bound the work. Each limit is several
+#: times what 120 read-backs of a real-analysis textbook use: at most 5.9 KB,
+#: 62 lines, 304 math delimiters, 72 backticks in runs of one, 2 brackets, and
+#: 3 columns of indentation. At every limit at once, validation stays near a
+#: second.
+TESTIMONY_MAX_BYTES = 32 * 1024
+TESTIMONY_MAX_LINES = 500
+TESTIMONY_MAX_MATH_DELIMITERS = 1024
+TESTIMONY_MAX_BACKTICKS = 512
+TESTIMONY_MAX_BACKTICK_RUN = 16
+TESTIMONY_MAX_BRACKETS = 256
+TESTIMONY_MAX_NESTING = 64
+_MATH_DELIMITER = re.compile(r"\$|\\[()\[\]]")
+_BACKTICK_RUN = re.compile(r"`+")
+#: Everything a line can open before its content: indentation, block quotes,
+#: and list markers, each of which nests one more block.
+_NESTING_PREFIX = re.compile(r"(?:[ >]|[-+*](?= )|\d{1,9}[.)](?= ))*")
 
 
 @dataclass(frozen=True, slots=True)
@@ -620,14 +675,25 @@ def _safe_model_label(value: str) -> bool:
 
 
 def _testimony_errors(text: str) -> tuple[str, ...]:
-    """Reject Markdown constructs that can emit active or remote HTML.
+    """Reject testimony that could run code, fetch remote content, or say more
+    or other than a reader sees.
 
     Read-backs need prose, lists, emphasis, code, and mathematical notation.
     They do not need links or embedded content. Parsing with the same relevant
     Markdown extensions catches reference links and attribute-list handlers
     that lexical URL filtering misses.
+
+    A testimony is measured against :data:`TESTIMONY_MAX_BYTES` and the other
+    limits first, and one that exceeds any of them is refused unparsed: every
+    card in a pull request is validated, so parsing must be bounded before
+    anything is known about it. What is then checked is what a reader is
+    shown: no invisible or reordering characters, whether typed or written as
+    HTML entities; no TeX that hides, overlaps, or redefines content in text
+    the typesetter reads; and at least one visible character.
     """
 
+    if limits := _testimony_limit_errors(text):
+        return limits
     parser = markdown_renderer.Markdown(
         extensions=list(SITE_EXTENSIONS),
         extension_configs=SITE_EXTENSION_CONFIGS,
@@ -666,7 +732,95 @@ def _testimony_errors(text: str) -> tuple[str, ...]:
             errors.append("user-supplied Markdown attributes are not allowed")
     if re.search(r"^ {0,3}(?:`{3,}|~{3,})[ \t]*mermaid(?:[ \t]|$)", text, re.MULTILINE | re.IGNORECASE):
         errors.append("active Mermaid blocks are not allowed")
+    # Entities are decoded in the parsed document, so `&#8203;` is caught here
+    # as surely as a typed zero-width space.
+    hidden = _hidden_characters(text + "".join(document.itertext()))
+    if hidden:
+        errors.append("invisible or reordering characters are not allowed: " + ", ".join(hidden))
+    typeset = _typeset_text(document)
+    if commands := sorted({match.group(0) for match in _HIDING_TEX_COMMAND.finditer(typeset)}):
+        errors.append("TeX that hides, overlaps, or redefines content is not allowed: " + ", ".join(commands))
+    if _STACKED_NEGATIVE_SPACE.search(typeset):
+        errors.append("repeated negative TeX spacing is not allowed: it slides symbols over one another")
+    if _TEX_COMMENT.search(typeset):
+        errors.append("TeX comments are not allowed: they drop the rest of their line; write \\% for a percent sign")
+    # Math delimiters are text until MathJax runs, and an empty formula shows nothing.
+    if not _MATH_DELIMITER.sub("", "".join(document.itertext())).strip():
+        errors.append("testimony renders no visible text")
     return tuple(dict.fromkeys(errors))
+
+
+def _testimony_limit_errors(text: str) -> tuple[str, ...]:
+    """Every limit a testimony exceeds, measured without parsing it."""
+
+    errors: list[str] = []
+    size = len(text.encode("utf-8"))
+    if size > TESTIMONY_MAX_BYTES:
+        errors.append(f"testimony is {size} bytes, over the {TESTIMONY_MAX_BYTES}-byte limit")
+    lines = text.split("\n")
+    if len(lines) > TESTIMONY_MAX_LINES:
+        errors.append(f"testimony has {len(lines)} lines, over the {TESTIMONY_MAX_LINES}-line limit")
+    delimiters = len(_MATH_DELIMITER.findall(text))
+    if delimiters > TESTIMONY_MAX_MATH_DELIMITERS:
+        errors.append(
+            f"testimony has {delimiters} math delimiters, over the limit of {TESTIMONY_MAX_MATH_DELIMITERS}"
+        )
+    backticks = text.count("`")
+    if backticks > TESTIMONY_MAX_BACKTICKS:
+        errors.append(f"testimony has {backticks} backticks, over the limit of {TESTIMONY_MAX_BACKTICKS}")
+    longest_run = max((len(run) for run in _BACKTICK_RUN.findall(text)), default=0)
+    if longest_run > TESTIMONY_MAX_BACKTICK_RUN:
+        errors.append(
+            f"testimony has a run of {longest_run} backticks, over the limit of {TESTIMONY_MAX_BACKTICK_RUN}"
+        )
+    brackets = text.count("[")
+    if brackets > TESTIMONY_MAX_BRACKETS:
+        errors.append(f"testimony has {brackets} opening brackets, over the limit of {TESTIMONY_MAX_BRACKETS}")
+    nesting = max((_NESTING_PREFIX.match(line.expandtabs(4)).end() for line in lines), default=0)
+    if nesting > TESTIMONY_MAX_NESTING:
+        errors.append(
+            f"testimony nests blocks {nesting} columns deep, over the limit of {TESTIMONY_MAX_NESTING}"
+        )
+    return tuple(errors)
+
+
+def _hidden_characters(text: str) -> list[str]:
+    """Name each distinct invisible or reordering character in ``text``."""
+
+    found: dict[str, None] = {}
+    for character in text:
+        if character in _ALLOWED_CONTROLS:
+            continue
+        if unicodedata.category(character) in _HIDDEN_CATEGORIES or ord(character) in _HIDDEN_CODE_POINTS:
+            name = unicodedata.name(character, "unnamed")
+            found[f"U+{ord(character):04X} {name}"] = None
+    return list(found)
+
+
+def _typeset_text(document: object) -> str:
+    """The text MathJax may typeset: everything outside code and preformatted
+    blocks, which it skips. Where the Markdown renderer recognized no formula,
+    MathJax can still find one, so the checks read all of this text rather
+    than only the spans the renderer marked as math."""
+
+    parts: list[str] = []
+
+    def walk(node: object, skipped: bool) -> None:
+        tag = getattr(node, "tag", None)
+        if not isinstance(tag, str):
+            return
+        skipped = skipped or tag.lower() in {"code", "pre"}
+        if not skipped and getattr(node, "text", None):
+            parts.append(node.text)  # type: ignore[attr-defined]
+        for child in node:  # type: ignore[attr-defined]
+            walk(child, skipped)
+            if not skipped and getattr(child, "tail", None):
+                parts.append(child.tail)
+
+    walk(document, False)
+    return "".join(parts)
+
+
 
 
 def _renderer_owned_attributes(tag: str, attributes: Mapping[str, str]) -> bool:

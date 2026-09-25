@@ -345,7 +345,17 @@ CLI. Cards live at
 filename avoids platform-specific Lean-name collisions. Each versioned card
 contains the exact packet, both hashes, a model label, and nonempty testimony.
 The loader rejects missing or unknown fields, altered packets, identity
-mismatches, and malformed or empty testimony. Writes use a no-follow directory
+mismatches, and malformed or empty testimony. Testimony must show a reader
+everything it says: invisible and reordering characters (zero-width spaces,
+bidirectional overrides), whether typed or written as HTML entities, and TeX
+that hides, overlaps, or redefines content (`\phantom`, `\rlap`, `\kern`,
+`\toggle`, `\bbox`, `\unicode`, macro definitions, comments) are rejected, as
+is testimony that renders no visible text. Before any card is parsed its
+testimony must fit limits several times what real read-backs use: 32 KiB, 500
+lines, 1,024 math delimiters, 512 backticks in runs of at most 16, 256 opening
+brackets, and 64 columns of nesting. The Markdown parser is superlinear in each
+of these, so a byte limit alone would not bound it, and every card in a pull
+request is read before its validity is known. Writes use a no-follow directory
 walk, an exclusive lock, a unique temporary file, atomic replacement, and an
 optional expected-card hash for compare-and-swap updates. `model:` remains a
 label supplied by the coordinator, not authenticated provenance.

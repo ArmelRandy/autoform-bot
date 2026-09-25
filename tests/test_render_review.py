@@ -5,7 +5,13 @@ from pathlib import Path
 import markdown as markdown_renderer
 import pytest
 
-from autoform_cli.readback import Readback, load_readbacks, write_readback
+from autoform_cli.readback import (
+    TESTIMONY_MAX_BRACKETS,
+    Readback,
+    _testimony_errors,
+    load_readbacks,
+    write_readback,
+)
 from autoform_cli.markdown import SITE_EXTENSION_CONFIGS, SITE_EXTENSIONS
 from autoform_cli.render import _mermaid_script, _readback_block, _skeleton_block
 from autoform_cli.skeleton import DeclarationSkeleton
@@ -198,6 +204,111 @@ def test_writer_keeps_inert_markdown_and_mathematics(tmp_path: Path) -> None:
         ("af_0123456789abcdef01234567", declaration.name)
     ].valid
     assert path.is_file()
+
+
+def _file(tmp_path: Path, testimony: str) -> Path:
+    declaration = _declaration()
+    return write_readback(
+        tmp_path,
+        article_id="af_0123456789abcdef01234567",
+        declaration=declaration,
+        model="reviewer",
+        text=testimony,
+        packet_text=declaration.blind_text(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("testimony", "reason"),
+    [
+        ("​", "U+200B ZERO WIDTH SPACE"),
+        ("The claim holds⁠ for all x.", "U+2060 WORD JOINER"),
+        ("The bound is ‮1 > x‬ for every x.", "U+202E RIGHT-TO-LEFT OVERRIDE"),
+        ("The claim holds&#8203; for all x.", "U+200B ZERO WIDTH SPACE"),
+        (r"For all $x$, $P(x) \phantom{\land Q(x)}$ holds.", r"\phantom"),
+        (r"$P \rlap{\,\land Q}$", r"\rlap"),
+        (r"$P \kern-2em \land Q$", r"\kern"),
+        (r"$\toggle{P}{P \land Q}\endtoggle$", r"\toggle"),
+        (r"$\bbox[black]{P}$", r"\bbox"),
+        (r"$\unicode{x200B}$", r"\unicode"),
+        (r"$\newcommand{\h}[1]{} P \h{\land Q}$", r"\newcommand"),
+        (r"$\def\h#1{} P \h{\land Q}$", r"\def"),
+        ("$P(x) % \\land Q(x)\n$", "TeX comments are not allowed"),
+        (r"$P\!\!\!\!\!\!Q$", "repeated negative TeX spacing"),
+        ("$ $", "renders no visible text"),
+    ],
+)
+def test_writer_rejects_testimony_that_hides_what_it_says(testimony: str, reason: str, tmp_path: Path) -> None:
+    """A reader must be shown everything the card says, and only that."""
+
+    with pytest.raises(ValueError, match="unsafe read-back testimony") as refused:
+        _file(tmp_path, testimony)
+
+    assert reason in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "testimony",
+    [
+        r"For every $x \in [0, 1]$ and the set $\{x\}$, the claim holds.",
+        r"Integrate with a thin negative space, $\int\! f$, once.",
+        r"At least $50\%$ of cases, or 50\% in prose.",
+        "Code such as `a % b` is shown as written.",
+        r"Height is kept with $\mathstrut x$ and a smash-free formula.",
+    ],
+)
+def test_writer_accepts_ordinary_mathematical_testimony(testimony: str, tmp_path: Path) -> None:
+    _file(tmp_path, testimony)
+
+    assert all(card.valid for card in load_readbacks(tmp_path).values())
+
+
+@pytest.mark.parametrize(
+    ("testimony", "limit"),
+    [
+        ("[" * 8000, "opening brackets"),
+        ("`" * 4000, "run of 4000 backticks"),
+        ("a `b` " * 600, "backticks"),
+        ("a $b$ " * 2000, "math delimiters"),
+        ("".join("  " * depth + "- a\n" for depth in range(512)), "columns deep"),
+        ("word " * 7000, "-byte limit"),
+        ("x\n" * 600, "-line limit"),
+    ],
+)
+def test_testimony_over_a_limit_is_refused_before_it_is_parsed(
+    testimony: str, limit: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parsing is superlinear in spans and openers, cubic in a backtick run,
+    and recursive in nesting: 8,000 brackets took ten seconds, 4,000 backticks
+    over two minutes, and a list 512 levels deep overflowed the stack."""
+
+    def unbounded(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the Markdown renderer ran on testimony over a limit")
+
+    monkeypatch.setattr("autoform_cli.readback.markdown_renderer.Markdown", unbounded)
+
+    assert any(limit in error for error in _testimony_errors(testimony))
+
+
+def test_a_card_over_a_limit_is_invalid_without_being_parsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every card in a pull request is read before its validity is known."""
+
+    path = _file(tmp_path, "A plain mathematical statement.")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("A plain mathematical statement.", "[" * 8000),
+        encoding="utf-8",
+    )
+
+    def unbounded(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the Markdown renderer ran on a card over a limit")
+
+    monkeypatch.setattr("autoform_cli.readback.markdown_renderer.Markdown", unbounded)
+    card = load_readbacks(tmp_path)[("af_0123456789abcdef01234567", _declaration().name)]
+
+    assert not card.valid
+    assert f"testimony has 8000 opening brackets, over the limit of {TESTIMONY_MAX_BRACKETS}" in card.validation_errors
 
 
 def test_card_frontmatter_round_trips_quoted_names_and_models(tmp_path: Path) -> None:
