@@ -399,7 +399,9 @@ def test_bounded_command_interruption_kills_the_process(tmp_path: Path, monkeypa
     assert not psutil.pid_exists(pid)
 
 
-def test_bounded_command_cleanup_reuses_one_deadline(tmp_path: Path, monkeypatch) -> None:
+def test_bounded_command_cleanup_reserves_time_and_reuses_final_deadline(
+    tmp_path: Path, monkeypatch
+) -> None:
     deadlines: list[float] = []
 
     def report_stuck_readers(readers, *, deadline: float) -> bool:
@@ -418,7 +420,8 @@ def test_bounded_command_cleanup_reuses_one_deadline(tmp_path: Path, monkeypatch
         )
 
     assert len(deadlines) == 3
-    assert len(set(deadlines)) == 1
+    assert deadlines[0] < deadlines[1]
+    assert deadlines[1] == deadlines[2]
 
 
 def test_probe_freshness_and_execution_share_one_deadline(tmp_path: Path, monkeypatch) -> None:
@@ -553,6 +556,49 @@ def test_lake_configuration_snapshot_rejects_a_named_pipe_without_blocking(tmp_p
 
     with pytest.raises(SkeletonError, match="not a regular file"):
         lean_libraries(tmp_path)
+
+
+def test_lake_configuration_snapshot_uses_content_not_file_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    fstat = os.fstat
+    calls = 0
+
+    def unstable_file_identity(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        values = list(fstat(descriptor))
+        values[1] += calls
+        return os.stat_result(values)
+
+    monkeypatch.setattr("autoform_cli.skeleton.os.fstat", unstable_file_identity)
+
+    (library,) = lean_libraries(project)
+
+    assert library.name == "Skel"
+
+
+def test_lake_configuration_snapshot_rejects_content_changed_between_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    lakefile = project / "lakefile.toml"
+    open_file = os.open
+    reads = 0
+
+    def change_before_second_read(path, flags, *args):
+        nonlocal reads
+        if Path(path) == lakefile:
+            reads += 1
+            if reads == 2:
+                lakefile.write_text('name = "Changed"\n', encoding="utf-8")
+        return open_file(path, flags, *args)
+
+    monkeypatch.setattr("autoform_cli.skeleton.os.open", change_before_second_read)
+
+    with pytest.raises(SkeletonError, match="changed while it was read"):
+        lean_libraries(project)
 
 
 # --------------------------------------------------------------------------- #

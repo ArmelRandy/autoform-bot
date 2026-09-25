@@ -622,15 +622,19 @@ def _sha256_id(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
-def _read_snapshot_file(path: Path) -> tuple[bytes, tuple[int, str]] | None:
-    """Read one bounded regular file without ever blocking on a special file."""
+def _read_snapshot_pass(
+    path: Path, *, keep_content: bool
+) -> tuple[bytes, tuple[int, str]] | None:
+    """Read one bounded regular-file pass."""
 
     try:
-        path.lstat()
+        path_metadata = path.lstat()
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise SkeletonError([f"cannot inspect skeleton input {path}: {exc}"]) from exc
+    if not stat.S_ISREG(path_metadata.st_mode):
+        raise SkeletonError([f"skeleton input is not a regular file: {path}"])
     flags = (
         os.O_RDONLY
         | getattr(os, "O_BINARY", 0)
@@ -639,11 +643,13 @@ def _read_snapshot_file(path: Path) -> tuple[bytes, tuple[int, str]] | None:
     )
     try:
         descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
     except OSError as exc:
         raise SkeletonError([f"cannot open skeleton input {path}: {exc}"]) from exc
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
             raise SkeletonError([f"skeleton input is not a regular file: {path}"])
         digest = hashlib.sha256()
         chunks: list[bytes] = []
@@ -658,35 +664,30 @@ def _read_snapshot_file(path: Path) -> tuple[bytes, tuple[int, str]] | None:
                     [f"skeleton input exceeds the {_SNAPSHOT_FILE_LIMIT}-byte limit: {path}"]
                 )
             digest.update(block)
-            chunks.append(block)
-        after = os.fstat(descriptor)
+            if keep_content:
+                chunks.append(block)
     except OSError as exc:
         raise SkeletonError([f"cannot read skeleton input {path}: {exc}"]) from exc
     finally:
         os.close(descriptor)
-    try:
-        current = path.stat()
-    except OSError as exc:
-        raise SkeletonError([f"skeleton input changed while it was read: {path}: {exc}"]) from exc
-    if _stat_identity(before) != _stat_identity(after) or _stat_identity(after) != _stat_identity(current):
-        raise SkeletonError([f"skeleton input changed while it was read: {path}"])
     return b"".join(chunks), (size, digest.hexdigest())
+
+
+def _read_snapshot_file(path: Path) -> tuple[bytes, tuple[int, str]] | None:
+    """Read a bounded regular file twice to reject concurrent content changes."""
+
+    captured = _read_snapshot_pass(path, keep_content=True)
+    verified = _read_snapshot_pass(path, keep_content=False)
+    captured_fingerprint = None if captured is None else captured[1]
+    verified_fingerprint = None if verified is None else verified[1]
+    if captured_fingerprint != verified_fingerprint:
+        raise SkeletonError([f"skeleton input changed while it was read: {path}"])
+    return captured
 
 
 def _snapshot_regular_file(path: Path) -> tuple[int, str] | None:
     captured = _read_snapshot_file(path)
     return None if captured is None else captured[1]
-
-
-def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (
-        value.st_dev,
-        value.st_ino,
-        value.st_mode,
-        value.st_size,
-        value.st_mtime_ns,
-        value.st_ctime_ns,
-    )
 
 
 def _project_control_snapshot(root: Path) -> tuple[tuple[str, tuple[int, str] | None], ...]:
@@ -786,6 +787,10 @@ def _terminate_process_tree(
     _remember_descendants(process, descendants)
     _remember_tagged_processes(token, descendants)
     children = [child for child in descendants.values() if _process_is_alive(child)]
+    phase_start = time.perf_counter()
+    available = _remaining(deadline)
+    process_deadline = phase_start + available * 0.8
+    term_deadline = phase_start + available * 0.4
     if os.name == "posix":
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -803,27 +808,21 @@ def _terminate_process_tree(
             except OSError:
                 pass
 
-    alive = children
-    if alive and _remaining(deadline) > 0:
+    if process.poll() is None:
         try:
-            _, alive = psutil.wait_procs(alive, timeout=_remaining(deadline))
-        except (psutil.Error, OSError):
-            pass
-    if process.poll() is None and _remaining(deadline) > 0:
-        try:
-            process.wait(timeout=_remaining(deadline))
+            process.wait(timeout=_remaining(term_deadline))
         except (OSError, subprocess.TimeoutExpired):
+            pass
+    if children and _remaining(term_deadline) > 0:
+        try:
+            psutil.wait_procs(children, timeout=_remaining(term_deadline))
+        except (psutil.Error, OSError):
             pass
 
     if os.name == "posix" and _process_group_is_alive(process.pid):
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
-            pass
-    for child in alive:
-        try:
-            child.kill()
-        except psutil.Error:
             pass
     _remember_tagged_processes(token, descendants)
     for child in descendants.values():
@@ -837,11 +836,18 @@ def _terminate_process_tree(
             process.kill()
         except OSError:
             pass
-        if _remaining(deadline) > 0:
-            try:
-                process.wait(timeout=_remaining(deadline))
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+    try:
+        process.wait(timeout=_remaining(process_deadline))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    live_children = [
+        child for child in descendants.values() if _process_is_alive(child)
+    ]
+    if live_children and _remaining(process_deadline) > 0:
+        try:
+            psutil.wait_procs(live_children, timeout=_remaining(process_deadline))
+        except (psutil.Error, OSError):
+            pass
 
 
 def _run_bounded_command(
@@ -890,6 +896,11 @@ def _run_bounded_command(
         except (OSError, ValueError) as exc:
             reader_errors.append(exc)
             reader_failure.set()
+        finally:
+            try:
+                stream.close()  # type: ignore[attr-defined]
+            except OSError:
+                pass
 
     descendants: dict[tuple[int, float], psutil.Process] = {}
     token = secrets.token_hex(16)
@@ -952,7 +963,11 @@ def _run_bounded_command(
                 token=token,
             )
             terminated = True
-        if not _join_readers(readers, deadline=cleanup_deadline):
+        reader_deadline = cleanup_deadline
+        if failure is None:
+            reader_start = time.perf_counter()
+            reader_deadline = reader_start + _remaining(cleanup_deadline) * 0.2
+        if not _join_readers(readers, deadline=reader_deadline):
             if failure is None:
                 failure = SkeletonError(
                     [f"{context} left descendant processes holding its output pipes open"]
@@ -996,10 +1011,7 @@ def _run_bounded_command(
                 if stream is None:
                     continue
                 if index < len(readers) and readers[index].is_alive():
-                    try:
-                        os.close(stream.fileno())
-                    except OSError:
-                        pass
+                    continue
                 else:
                     stream.close()
 
