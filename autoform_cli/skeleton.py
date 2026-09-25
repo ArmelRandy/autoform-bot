@@ -29,18 +29,26 @@ same sources produce the same JSON, and nothing here writes into the vault.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
 import re
 import secrets
+import signal
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+import psutil
 
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import SourceIndex, declaration_names, index_project, strip_lean_comments
@@ -51,7 +59,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
 SKELETON_SCHEMA = "autoform-skeleton/v2"
-SEMANTIC_SCHEMA = "autoform-lean-expr/v1"
+SEMANTIC_SCHEMA = "autoform-lean-expr/v2"
 
 #: Every line the probe wants read back starts with this marker, so Lean's own
 #: informational output can never be mistaken for a result.
@@ -62,6 +70,16 @@ PROBE_MARKER = "AUTOFORM_SKELETON "
 _CORE_MODULE_ROOTS = ("Init", "Lean", "Std", "Lake")
 
 DEFAULT_PROBE_TIMEOUT = 600.0
+DEFAULT_PROBE_OUTPUT_LIMIT = 64 * 1024 * 1024
+_PROCESS_TERMINATION_GRACE = 2.0
+_PROCESS_TOKEN_ENV = "_AUTOFORM_PROCESS_TOKEN"
+_SNAPSHOT_FILE_LIMIT = 64 * 1024 * 1024
+_PROJECT_CONTROL_FILES = (
+    "lakefile.toml",
+    "lakefile.lean",
+    "lean-toolchain",
+    "lake-manifest.json",
+)
 
 #: A callable that runs a probe and returns Lean's standard output. The default
 #: shells out to ``lake env lean``; tests substitute a fake.
@@ -604,6 +622,388 @@ def _sha256_id(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
+def _read_snapshot_file(path: Path) -> tuple[bytes, tuple[int, str]] | None:
+    """Read one bounded regular file without ever blocking on a special file."""
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SkeletonError([f"cannot inspect skeleton input {path}: {exc}"]) from exc
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise SkeletonError([f"cannot open skeleton input {path}: {exc}"]) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SkeletonError([f"skeleton input is not a regular file: {path}"])
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            size += len(block)
+            if size > _SNAPSHOT_FILE_LIMIT:
+                raise SkeletonError(
+                    [f"skeleton input exceeds the {_SNAPSHOT_FILE_LIMIT}-byte limit: {path}"]
+                )
+            digest.update(block)
+            chunks.append(block)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise SkeletonError([f"cannot read skeleton input {path}: {exc}"]) from exc
+    finally:
+        os.close(descriptor)
+    try:
+        current = path.stat()
+    except OSError as exc:
+        raise SkeletonError([f"skeleton input changed while it was read: {path}: {exc}"]) from exc
+    if _stat_identity(before) != _stat_identity(after) or _stat_identity(after) != _stat_identity(current):
+        raise SkeletonError([f"skeleton input changed while it was read: {path}"])
+    return b"".join(chunks), (size, digest.hexdigest())
+
+
+def _snapshot_regular_file(path: Path) -> tuple[int, str] | None:
+    captured = _read_snapshot_file(path)
+    return None if captured is None else captured[1]
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _project_control_snapshot(root: Path) -> tuple[tuple[str, tuple[int, str] | None], ...]:
+    """Fingerprint the Lake inputs that select the compiled environment."""
+
+    return tuple(
+        (name, _snapshot_regular_file(root / name)) for name in _PROJECT_CONTROL_FILES
+    )
+
+
+def _graph_snapshot(graph: Graph) -> tuple[tuple[str, str, str], ...]:
+    """Fingerprint the exact Markdown articles used to choose declarations."""
+
+    return tuple(
+        (
+            node.id,
+            _article_path(node, graph),
+            node.source_sha256 or "",
+        )
+        for node in sorted(graph.nodes.values(), key=lambda item: item.id)
+    )
+
+
+def _remember_descendants(
+    process: subprocess.Popen[bytes],
+    descendants: dict[tuple[int, float], psutil.Process],
+) -> None:
+    """Retain handles for children that may outlive their immediate parent."""
+
+    try:
+        children = psutil.Process(process.pid).children(recursive=True)
+    except (psutil.Error, OSError):
+        return
+    for child in children:
+        try:
+            descendants[(child.pid, child.create_time())] = child
+        except (psutil.Error, OSError):
+            continue
+
+
+def _remember_tagged_processes(
+    token: str,
+    descendants: dict[tuple[int, float], psutil.Process],
+) -> None:
+    """Find descendants that escaped the original parent and process group."""
+
+    for candidate in psutil.process_iter():
+        if candidate.pid == os.getpid():
+            continue
+        try:
+            if candidate.environ().get(_PROCESS_TOKEN_ENV) == token:
+                descendants[(candidate.pid, candidate.create_time())] = candidate
+        except (psutil.Error, OSError):
+            continue
+
+
+def _process_is_alive(process: psutil.Process) -> bool:
+    try:
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except (psutil.Error, OSError):
+        return False
+
+
+def _process_group_is_alive(pid: int) -> bool:
+    if os.name != "posix":
+        return False
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, deadline - time.perf_counter())
+
+
+def _join_readers(readers: list[threading.Thread], *, deadline: float) -> bool:
+    for reader in readers:
+        reader.join(timeout=_remaining(deadline))
+    return not any(reader.is_alive() for reader in readers)
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[bytes],
+    descendants: dict[tuple[int, float], psutil.Process],
+    *,
+    deadline: float,
+    token: str,
+) -> None:
+    """Best-effort termination of a command and every descendant observed."""
+
+    _remember_descendants(process, descendants)
+    _remember_tagged_processes(token, descendants)
+    children = [child for child in descendants.values() if _process_is_alive(child)]
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    else:  # pragma: no cover - Windows-specific best effort
+        for child in reversed(children):
+            try:
+                child.terminate()
+            except psutil.Error:
+                pass
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    alive = children
+    if alive and _remaining(deadline) > 0:
+        try:
+            _, alive = psutil.wait_procs(alive, timeout=_remaining(deadline))
+        except (psutil.Error, OSError):
+            pass
+    if process.poll() is None and _remaining(deadline) > 0:
+        try:
+            process.wait(timeout=_remaining(deadline))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    if os.name == "posix" and _process_group_is_alive(process.pid):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    for child in alive:
+        try:
+            child.kill()
+        except psutil.Error:
+            pass
+    _remember_tagged_processes(token, descendants)
+    for child in descendants.values():
+        if _process_is_alive(child):
+            try:
+                child.kill()
+            except psutil.Error:
+                pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        if _remaining(deadline) > 0:
+            try:
+                process.wait(timeout=_remaining(deadline))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def _run_bounded_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    context: str,
+    env: dict[str, str] | None = None,
+    output_limit: int = DEFAULT_PROBE_OUTPUT_LIMIT,
+) -> subprocess.CompletedProcess[str]:
+    """Run one command with bounded output, time, and descendant lifetime."""
+
+    if timeout <= 0:
+        raise SkeletonError([f"{context} timed out"])
+    if output_limit < 1:
+        raise ValueError("output_limit must be positive")
+    popen_options: dict[str, object] = {}
+    if os.name == "posix":
+        popen_options["start_new_session"] = True
+    elif os.name == "nt":  # pragma: no cover - Windows-specific best effort
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    process: subprocess.Popen[bytes] | None = None
+    readers: list[threading.Thread] = []
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    capture_lock = threading.Lock()
+    overflow = threading.Event()
+    reader_failure = threading.Event()
+    reader_errors: list[BaseException] = []
+    captured = 0
+
+    def drain(name: str, stream: object) -> None:
+        nonlocal captured
+        try:
+            while True:
+                block = stream.read(64 * 1024)  # type: ignore[attr-defined]
+                if not block:
+                    return
+                with capture_lock:
+                    remaining = max(0, output_limit - captured)
+                    if remaining:
+                        chunks[name].append(block[:remaining])
+                    if len(block) > remaining:
+                        overflow.set()
+                    captured = min(output_limit + 1, captured + len(block))
+        except (OSError, ValueError) as exc:
+            reader_errors.append(exc)
+            reader_failure.set()
+
+    descendants: dict[tuple[int, float], psutil.Process] = {}
+    token = secrets.token_hex(16)
+    process_env = os.environ.copy() if env is None else env.copy()
+    process_env[_PROCESS_TOKEN_ENV] = token
+    deadline = time.monotonic() + timeout
+    cleanup_deadline: float | None = None
+    failure: SkeletonError | None = None
+    terminated = False
+    try:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=process_env,
+                close_fds=True,
+                **popen_options,
+            )
+        except OSError as exc:
+            raise SkeletonError([f"{context} failed: {exc}"]) from exc
+        assert process.stdout is not None and process.stderr is not None
+        for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+            reader = threading.Thread(target=drain, args=(name, stream), daemon=True)
+            reader.start()
+            readers.append(reader)
+        while process.poll() is None:
+            _remember_descendants(process, descendants)
+            if reader_failure.is_set():
+                failure = SkeletonError(
+                    [f"{context} output could not be read: {reader_errors[0]}"]
+                )
+                break
+            if overflow.is_set():
+                failure = SkeletonError(
+                    [f"{context} exceeded the {output_limit}-byte output limit"]
+                )
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = SkeletonError([f"{context} timed out after {timeout:g} seconds"])
+                break
+            overflow.wait(min(0.05, remaining))
+        _remember_descendants(process, descendants)
+        _remember_tagged_processes(token, descendants)
+        live_descendants = any(
+            _process_is_alive(descendant) for descendant in descendants.values()
+        )
+        live_group = _process_group_is_alive(process.pid)
+        if failure is None and (live_descendants or live_group):
+            failure = SkeletonError([f"{context} left descendant processes running"])
+        cleanup_deadline = time.perf_counter() + _PROCESS_TERMINATION_GRACE
+        if failure is not None:
+            _terminate_process_tree(
+                process,
+                descendants,
+                deadline=cleanup_deadline,
+                token=token,
+            )
+            terminated = True
+        if not _join_readers(readers, deadline=cleanup_deadline):
+            if failure is None:
+                failure = SkeletonError(
+                    [f"{context} left descendant processes holding its output pipes open"]
+                )
+            if not terminated:
+                _terminate_process_tree(
+                    process,
+                    descendants,
+                    deadline=cleanup_deadline,
+                    token=token,
+                )
+                terminated = True
+            _join_readers(readers, deadline=cleanup_deadline)
+        if failure is not None:
+            raise failure
+        if overflow.is_set():
+            raise SkeletonError([f"{context} exceeded the {output_limit}-byte output limit"])
+        if reader_errors:
+            raise SkeletonError([f"{context} output could not be read: {reader_errors[0]}"])
+        try:
+            stdout = b"".join(chunks["stdout"]).decode("utf-8")
+            stderr = b"".join(chunks["stderr"]).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SkeletonError([f"{context} emitted invalid UTF-8 output"]) from exc
+        return subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
+    except BaseException:
+        if cleanup_deadline is None:
+            cleanup_deadline = time.perf_counter() + _PROCESS_TERMINATION_GRACE
+        if process is not None and not terminated:
+            _terminate_process_tree(
+                process,
+                descendants,
+                deadline=cleanup_deadline,
+                token=token,
+            )
+        _join_readers(readers, deadline=cleanup_deadline)
+        raise
+    finally:
+        if process is not None:
+            for index, stream in enumerate((process.stdout, process.stderr)):
+                if stream is None:
+                    continue
+                if index < len(readers) and readers[index].is_alive():
+                    try:
+                        os.close(stream.fileno())
+                    except OSError:
+                        pass
+                else:
+                    stream.close()
+
+
 # --------------------------------------------------------------------------- #
 # Lean project layout
 # --------------------------------------------------------------------------- #
@@ -629,9 +1029,12 @@ def lean_libraries(lean_root: str | Path) -> tuple[LeanLibrary, ...]:
 
     root = Path(lean_root).expanduser().resolve()
     toml = root / "lakefile.toml"
-    if toml.is_file():
-        text = toml.read_bytes()
-    elif (root / "lakefile.lean").is_file():
+    toml_snapshot = _read_snapshot_file(toml)
+    lakefile = root / "lakefile.lean"
+    lakefile_snapshot = _read_snapshot_file(lakefile)
+    if toml_snapshot is not None:
+        text = toml_snapshot[0]
+    elif lakefile_snapshot is not None:
         text = _translate_lakefile(root)
     else:
         raise SkeletonError([f"no lakefile.toml or lakefile.lean in {root}"])
@@ -665,21 +1068,19 @@ def _translate_lakefile(root: Path) -> bytes:
         raise SkeletonError(["lake is not on PATH, so lakefile.lean cannot be evaluated"])
     with tempfile.TemporaryDirectory(prefix="autoform-skeleton-") as scratch:
         target = Path(scratch) / "lakefile.toml"
-        try:
-            result = subprocess.run(
-                [lake, "translate-config", "toml", str(target)],
-                cwd=str(root),
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SkeletonError([f"lake translate-config failed: {exc}"]) from exc
-        if result.returncode != 0 or not target.is_file():
+        result = _run_bounded_command(
+            [lake, "translate-config", "toml", str(target)],
+            cwd=root,
+            timeout=120,
+            context="lake translate-config",
+        )
+        if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()[:300]
             raise SkeletonError([f"lake translate-config failed: {detail}"])
-        return target.read_bytes()
+        translated = _read_snapshot_file(target)
+        if translated is None:
+            raise SkeletonError(["lake translate-config failed: translated configuration is missing"])
+        return translated[0]
 
 
 def module_of(path: Path, libraries: tuple[LeanLibrary, ...]) -> str | None:
@@ -823,17 +1224,12 @@ def _check_artifacts_fresh(
 ) -> None:
     """Ask Lake to prove that imported artifacts match their exact inputs."""
 
-    try:
-        result = subprocess.run(
-            [lake, "--rehash", "--no-build", "build", *modules],
-            cwd=str(lean_root),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise SkeletonError([f"cannot verify Lean build freshness: {exc}"]) from exc
+    result = _run_bounded_command(
+        [lake, "--rehash", "--no-build", "build", *modules],
+        cwd=lean_root,
+        timeout=timeout,
+        context="cannot verify Lean build freshness",
+    )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise SkeletonError([f"Lean build artifacts are stale; run `lake build` before extracting skeletons\n{detail}"])
@@ -850,24 +1246,25 @@ def run_probe(probe: str, lean_root: Path, *, timeout: float = DEFAULT_PROBE_TIM
             ["lake-manifest.json is missing; run `lake build` before extracting skeletons"]
         )
     modules = _probe_modules(probe)
-    _check_artifacts_fresh(lake, lean_root, modules, timeout=timeout)
+    deadline = time.monotonic() + timeout
+    _check_artifacts_fresh(
+        lake,
+        lean_root,
+        modules,
+        timeout=max(0.0, deadline - time.monotonic()),
+    )
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     with tempfile.TemporaryDirectory(prefix="autoform-skeleton-") as scratch:
         source = Path(scratch) / "AutoformSkeletonProbe.lean"
         source.write_text(probe, encoding="utf-8")
-        try:
-            result = subprocess.run(
-                [lake, "env", "lean", str(source)],
-                cwd=str(lean_root),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                env=env,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SkeletonError([f"lake env lean failed: {exc}"]) from exc
+        result = _run_bounded_command(
+            [lake, "env", "lean", str(source)],
+            cwd=lean_root,
+            timeout=max(0.0, deadline - time.monotonic()),
+            context="lake env lean",
+            env=env,
+        )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise SkeletonError([f"the skeleton probe failed; is the project built with `lake build`?\n{detail}"])
@@ -1042,18 +1439,74 @@ def _validate_semantic_material(
 ) -> None:
     try:
         payload = json.loads(semantic)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise SkeletonError([f"invalid elaborated semantic material for {context}"]) from exc
-    expected = None
-    if kind is not None:
-        expected = {
-            "def": {"type", "value"},
-            "instance": {"type", "value"},
-            "opaque": {"type", "value"},
-            "class": {"type", "constructors"},
-            "inductive": {"type", "constructors"},
-            "structure": {"type", "constructors"},
-        }.get(kind, {"type"})
+    if not isinstance(payload, dict) or payload.keys() != {"generated", "root"}:
+        raise SkeletonError([f"invalid elaborated semantic material for {context}"])
+    expected = _semantic_keys_for_kind(kind) if kind is not None else None
+    _validate_semantic_payload(payload["root"], context=context, expected=expected)
+    generated = payload["generated"]
+    if not isinstance(generated, list):
+        raise SkeletonError([f"invalid elaborated semantic material for {context}"])
+    names: list[str] = []
+    for entry in generated:
+        if (
+            not isinstance(entry, dict)
+            or entry.keys() != {"material", "name"}
+            or not _valid_semantic_name(entry["name"])
+        ):
+            raise SkeletonError([f"invalid elaborated semantic material for {context}"])
+        names.append(json.dumps(entry["name"], sort_keys=True, separators=(",", ":")))
+        _validate_semantic_payload(entry["material"], context=context, expected=None)
+    if len(names) != len(set(names)):
+        raise SkeletonError([f"invalid elaborated semantic material for {context}"])
+
+
+def _valid_semantic_name(value: object) -> bool:
+    depth = 0
+    while value is not None:
+        if not isinstance(value, dict) or len(value) != 1:
+            return False
+        if "str" in value:
+            pair = value["str"]
+            if (
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or not isinstance(pair[1], str)
+            ):
+                return False
+        elif "num" in value:
+            pair = value["num"]
+            if (
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or type(pair[1]) is not int
+                or pair[1] < 0
+            ):
+                return False
+        else:
+            return False
+        value = pair[0]
+        depth += 1
+        if depth > 256:
+            return False
+    return True
+
+
+def _semantic_keys_for_kind(kind: str) -> set[str]:
+    return {
+        "def": {"type", "value"},
+        "instance": {"type", "value"},
+        "opaque": {"type", "value"},
+        "class": {"type", "constructors"},
+        "inductive": {"type", "constructors"},
+        "structure": {"type", "constructors"},
+    }.get(kind, {"type"})
+
+
+def _validate_semantic_payload(
+    payload: object, *, context: str, expected: set[str] | None
+) -> None:
     allowed = ({"type"}, {"type", "value"}, {"type", "constructors"})
     if not isinstance(payload, dict) or (
         expected is not None and payload.keys() != expected
@@ -1197,7 +1650,13 @@ def extract_skeletons(
     except GraphValidationError as exc:
         raise SkeletonError(exc.issues) from exc
     root = Path(lean_root).expanduser().resolve()
+    graph_snapshot = _graph_snapshot(graph)
+    control_snapshot = _project_control_snapshot(root)
     libraries = lean_libraries(root)
+    if _project_control_snapshot(root) != control_snapshot:
+        raise SkeletonError(
+            ["Lean project configuration changed while skeletons were being extracted; retry after the project is idle"]
+        )
     index = index_project(root)
     report = extract_graph_skeletons(
         graph,
@@ -1207,8 +1666,31 @@ def extract_skeletons(
         runner=runner or run_probe,
         node_ids=node_ids,
     )
-    if runner is None and index_project(root).source_digest != index.source_digest:
+    if index_project(root).source_digest != index.source_digest:
         raise SkeletonError(["Lean sources changed while skeletons were being extracted; retry after the build is idle"])
+    if _project_control_snapshot(root) != control_snapshot:
+        raise SkeletonError(
+            ["Lean project configuration changed while skeletons were being extracted; retry after the project is idle"]
+        )
+    try:
+        current_graph = load_graph(graph.blueprint_dir)
+    except GraphValidationError as exc:
+        raise SkeletonError(
+            ["the blueprint changed while skeletons were being extracted; retry after the project is idle"]
+        ) from exc
+    if _graph_snapshot(current_graph) != graph_snapshot:
+        raise SkeletonError(
+            ["the blueprint changed while skeletons were being extracted; retry after the project is idle"]
+        )
+    for node in report.nodes:
+        current = current_graph.nodes.get(node.node_id)
+        if current is None or source_passage(current, current_graph.blueprint_dir) != (
+            node.passage,
+            node.passage_locator,
+        ):
+            raise SkeletonError(
+                [f"{node.node_id}: source passage changed while skeletons were being extracted; retry after the project is idle"]
+            )
     return report
 
 
@@ -1230,6 +1712,7 @@ def extract_graph_skeletons(
         if unknown:
             raise SkeletonError([f"unknown article: {node_id}" for node_id in unknown])
         selected = [node for node in selected if node.id in wanted]
+    passages = {node.id: source_passage(node, graph.blueprint_dir) for node in selected}
 
     unresolved: list[str] = []
     imports: set[str] = set()
@@ -1283,7 +1766,7 @@ def extract_graph_skeletons(
                     snapshot_started_ns=snapshot_started_ns,
                 )
             )
-        passage, locator = source_passage(node, graph.blueprint_dir)
+        passage, locator = passages[node.id]
         nodes.append(
             NodeSkeleton(
                 node_id=node.id,
@@ -1325,12 +1808,15 @@ def source_passage(node: Node, blueprint: Path) -> tuple[str | None, str | None]
         candidate = (node.path.parent / path).resolve()
         try:
             candidate.relative_to(blueprint.resolve())
+            captured = _read_snapshot_file(candidate)
+            if captured is None:
+                continue
             # Lines are what an editor or `sed` counts: newline-separated. Python's
             # `splitlines` also breaks on form feeds, which `pdftotext` writes
             # between pages, and every locator into such a file would then drift
             # by one line per page.
-            lines = candidate.read_text(encoding="utf-8").split("\n")
-        except (ValueError, OSError, UnicodeError):
+            lines = captured[0].decode("utf-8").split("\n")
+        except (ValueError, UnicodeError):
             continue
         start = int(match.group(1))
         end = int(match.group(2) or start)
@@ -1562,9 +2048,17 @@ def _output_identity(path: Path) -> tuple[int, int, str] | None:
         raise SkeletonError([f"cannot inspect skeleton output {path}: {exc}"]) from exc
     if path.is_symlink():
         raise SkeletonError([f"refusing symlink packet output: {path}"])
-    if not path.is_dir():
-        raise SkeletonError([f"packet output exists and is not a directory: {path}"])
     digest = hashlib.sha256()
+    if path.is_file():
+        try:
+            digest.update(b"file\0")
+            digest.update(path.read_bytes())
+        except OSError as exc:
+            raise SkeletonError([f"cannot inspect skeleton output {path}: {exc}"]) from exc
+        return metadata.st_dev, metadata.st_ino, digest.hexdigest()
+    if not path.is_dir():
+        raise SkeletonError([f"skeleton output is not a regular file or directory: {path}"])
+    digest.update(b"directory\0")
     try:
         for child in sorted(path.rglob("*"), key=lambda candidate: candidate.relative_to(path).as_posix()):
             relative = child.relative_to(path).as_posix()
@@ -1589,6 +2083,8 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
     identity = _output_identity(path)
     if identity is None:
         return identity
+    if not path.is_dir():
+        raise SkeletonError([f"packet output exists and is not a directory: {path}"])
     try:
         if not any(path.iterdir()):
             return identity
@@ -1666,16 +2162,175 @@ def _stage_output(destination: Path) -> Path:
     raise SkeletonError([f"cannot allocate staging directory beside {destination}"])
 
 
+def _stage_report_output(
+    report: SkeletonReport,
+    destination: Path,
+) -> tuple[Path, tuple[int, int, str] | None]:
+    """Write a report to a same-directory stage and capture the old identity."""
+
+    identity = _output_identity(destination)
+    existing_mode: int | None = None
+    if identity is not None:
+        if not destination.is_file():
+            raise SkeletonError([f"report output exists and is not a regular file: {destination}"])
+        existing_mode = destination.stat().st_mode & 0o7777
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(100):
+        stage = destination.with_name(
+            f".{destination.name}.autoform-stage-{secrets.token_hex(8)}"
+        )
+        try:
+            with stage.open("x", encoding="utf-8") as stream:
+                stream.write(report.to_json() + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            if existing_mode is not None:
+                stage.chmod(existing_mode)
+        except FileExistsError:
+            continue
+        except BaseException:
+            stage.unlink(missing_ok=True)
+            raise
+        return stage, identity
+    raise SkeletonError([f"cannot allocate staging file beside {destination}"])
+
+
+def _remove_output(path: Path) -> None:
+    """Remove one transaction-owned file or directory without following links."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    """Atomically rename ``source`` only when ``destination`` is absent."""
+
+    if os.name == "nt":  # pragma: no cover - Windows-specific path
+        os.rename(source, destination)
+        return
+
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as exc:
+            raise SkeletonError(
+                ["atomic no-replace rename is unavailable on this Linux system"]
+            ) from exc
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, destination_bytes, 1)
+    elif sys.platform == "darwin":
+        try:
+            rename = library.renamex_np
+        except AttributeError as exc:
+            raise SkeletonError(
+                ["atomic no-replace rename is unavailable on this macOS system"]
+            ) from exc
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, 0x00000004)
+    else:
+        raise SkeletonError(
+            [f"atomic no-replace rename is unsupported on {sys.platform}"]
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+def _install_output(stage: Path, destination: Path) -> None:
+    """Install a stage without overwriting a concurrent output."""
+
+    metadata = stage.lstat()
+    if stat.S_ISREG(metadata.st_mode):
+        os.link(stage, destination)
+        stage.unlink()
+    else:
+        _rename_no_replace(stage, destination)
+
+
+def _preflight_output_installs(
+    outputs: list[tuple[Path, Path, tuple[int, int, str] | None]],
+) -> None:
+    """Prove each destination filesystem supports its artifact install."""
+
+    checked: set[tuple[int, int]] = set()
+    for destination, stage, _ in outputs:
+        try:
+            stage_metadata = stage.lstat()
+            device = destination.parent.stat().st_dev
+        except OSError as exc:
+            raise SkeletonError([f"cannot inspect skeleton output stage {stage}: {exc}"]) from exc
+        artifact_kind = stat.S_IFMT(stage_metadata.st_mode)
+        if artifact_kind not in {stat.S_IFREG, stat.S_IFDIR}:
+            raise SkeletonError([f"skeleton output stage is not a file or directory: {stage}"])
+        key = (device, artifact_kind)
+        if key in checked:
+            continue
+        checked.add(key)
+        probe_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.autoform-preflight-",
+                dir=destination.parent,
+            )
+        )
+        source = probe_root / "source"
+        target = probe_root / "target"
+        try:
+            if artifact_kind == stat.S_IFREG:
+                source.touch(exist_ok=False)
+            else:
+                source.mkdir()
+            _install_output(source, target)
+        except BaseException:
+            try:
+                _remove_output(probe_root)
+            except OSError as cleanup_exc:
+                warnings.warn(
+                    f"could not remove output preflight artifacts at {probe_root}: {cleanup_exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            raise
+        try:
+            _remove_output(probe_root)
+        except OSError as cleanup_exc:
+            raise SkeletonError(
+                [f"could not remove output preflight artifacts at {probe_root}: {cleanup_exc}"]
+            ) from cleanup_exc
+
+
 def _replace_outputs(
     outputs: list[tuple[Path, Path, tuple[int, int, str] | None]],
 ) -> None:
-    """Commit staged output trees together, rolling all of them back on failure."""
+    """Commit staged outputs with rollback, but not cross-path linearizability.
 
+    Each rename is atomic. Readers can still observe the interval between the
+    renames; avoiding that requires one shared generation pointer rather than
+    another rollback branch.
+    """
+
+    _preflight_output_installs(outputs)
     for destination, _, identity in outputs:
         if _output_identity(destination) != identity:
             raise SkeletonError([f"packet output changed during publication: {destination}"])
-    backups: dict[Path, Path] = {}
-    installed: dict[Path, tuple[int, int, str]] = {}
+    backups: dict[Path, tuple[Path, tuple[int, int, str]]] = {}
+    installs: dict[Path, tuple[Path, tuple[int, int, str]]] = {}
     try:
         for destination, _, identity in outputs:
             if identity is None:
@@ -1683,22 +2338,28 @@ def _replace_outputs(
             backup = destination.with_name(
                 f".{destination.name}.autoform-backup-{secrets.token_hex(8)}"
             )
+            backups[destination] = (backup, identity)
             os.replace(destination, backup)
-            backups[destination] = backup
             if _output_identity(backup) != identity:
                 raise SkeletonError([f"packet output changed during publication: {destination}"])
         for destination, stage, _ in outputs:
             stage_identity = _output_identity(stage)
             if stage_identity is None:
                 raise SkeletonError([f"skeleton output stage disappeared: {stage}"])
-            os.replace(stage, destination)
-            installed[destination] = stage_identity
-    except (OSError, SkeletonError) as exc:
+            installs[destination] = (stage, stage_identity)
+            _install_output(stage, destination)
+    except BaseException as exc:
         conflicts: set[Path] = set()
         rollback_issues: list[str] = []
-        for destination, expected in reversed(installed.items()):
+        for destination, (stage, expected) in reversed(installs.items()):
             try:
-                if _output_identity(destination) != expected:
+                stage_identity = _output_identity(stage)
+                destination_identity = _output_identity(destination)
+                if stage_identity == expected and destination_identity is None:
+                    continue
+                if destination_identity != expected:
+                    if destination_identity is None:
+                        continue
                     conflicts.add(destination)
                     rollback_issues.append(
                         f"published output changed during rollback and was preserved at {destination}"
@@ -1708,39 +2369,75 @@ def _replace_outputs(
                     f".{destination.name}.autoform-rollback-{secrets.token_hex(8)}"
                 )
                 os.replace(destination, quarantine)
-                if _output_identity(quarantine) != expected:
-                    conflicts.add(destination)
+                try:
+                    quarantine_identity = _output_identity(quarantine)
+                    if quarantine_identity != expected:
+                        rollback_issues.append(
+                            f"changed rolled-back output was preserved for recovery at {quarantine}"
+                        )
+                        continue
+                    _remove_output(quarantine)
+                except (OSError, SkeletonError) as cleanup_exc:
                     rollback_issues.append(
-                        f"concurrent output was preserved for recovery at {quarantine}"
+                        f"could not remove rolled-back output preserved for recovery at {quarantine}: {cleanup_exc}"
                     )
-                    continue
-                shutil.rmtree(quarantine)
             except (OSError, SkeletonError) as rollback_exc:
-                conflicts.add(destination)
+                if _output_identity(destination) is not None:
+                    conflicts.add(destination)
                 rollback_issues.append(
                     f"could not roll back skeleton output {destination}: {rollback_exc}"
                 )
-        for destination, backup in backups.items():
+        for destination, (backup, expected) in backups.items():
             if destination in conflicts:
                 rollback_issues.append(f"previous output was preserved for recovery at {backup}")
                 continue
             try:
-                if backup.exists() and not destination.exists():
-                    os.replace(backup, destination)
-                elif backup.exists():
+                backup_identity = _output_identity(backup)
+                destination_identity = _output_identity(destination)
+                if backup_identity is not None and destination_identity is None:
+                    _install_output(backup, destination)
+                elif backup_identity == expected:
                     rollback_issues.append(f"previous output was preserved for recovery at {backup}")
-            except OSError as rollback_exc:
+                elif backup_identity is None and destination_identity == expected:
+                    continue
+                elif backup_identity is not None:
+                    rollback_issues.append(f"changed backup was preserved for recovery at {backup}")
+                else:
+                    rollback_issues.append(
+                        f"could not find previous skeleton output for {destination} during rollback"
+                    )
+            except (OSError, SkeletonError) as rollback_exc:
                 rollback_issues.append(
                     f"could not restore skeleton output {destination}; previous output remains at {backup}: {rollback_exc}"
                 )
-        issues = (
-            list(exc.issues)
-            if isinstance(exc, SkeletonError)
-            else [f"could not publish skeleton output: {exc}"]
-        )
+        if not isinstance(exc, (OSError, SkeletonError)):
+            raise
+        issues = list(exc.issues) if isinstance(exc, SkeletonError) else [f"could not publish skeleton output: {exc}"]
         raise SkeletonError([*issues, *rollback_issues]) from exc
-    for backup in backups.values():
-        shutil.rmtree(backup)
+    for backup, expected in backups.values():
+        try:
+            backup_identity = _output_identity(backup)
+            if backup_identity is None:
+                warnings.warn(
+                    f"skeleton output backup disappeared before cleanup: {backup}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            if backup_identity != expected:
+                warnings.warn(
+                    f"skeleton output backup changed before cleanup and was preserved at {backup}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            _remove_output(backup)
+        except (OSError, SkeletonError) as cleanup_exc:
+            warnings.warn(
+                f"could not remove previous skeleton output preserved at {backup}: {cleanup_exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
@@ -1753,11 +2450,35 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     )
 
 
+def write_skeleton_report(report: SkeletonReport, destination: str | Path) -> Path:
+    """Failure-atomically replace one JSON skeleton report."""
+
+    requested = Path(destination).expanduser()
+    if requested.is_symlink():
+        raise SkeletonError([f"refusing symlink report output: {requested}"])
+    output = Path(os.path.abspath(requested))
+    stage: Path | None = None
+    try:
+        stage, identity = _stage_report_output(report, output)
+        _replace_outputs([(output, stage, identity)])
+        stage = None
+    except OSError as exc:
+        raise SkeletonError([f"could not prepare skeleton report output: {exc}"]) from exc
+    finally:
+        if stage is not None:
+            try:
+                _remove_output(stage)
+            except OSError:
+                pass
+    return output
+
+
 def write_packets(
     report: SkeletonReport,
     directory: str | Path,
     *,
     passages: str | Path | None = None,
+    report_path: str | Path | None = None,
 ) -> list[Path]:
     """Write one blind packet per skeleton for independent auditors.
 
@@ -1771,7 +2492,15 @@ def write_packets(
     second directory, one ``passage.txt`` per article. A faithfulness judge
     gets a packet and its passage; an auditor of one declaration gets the
     packet alone, which is why the two never share a directory.
+
+    With ``report_path``, the JSON report joins the same failure-atomic
+    publication transaction.
     """
+
+    if not report.clean:
+        raise SkeletonError(
+            ["refusing to publish review packets from an incomplete skeleton report"]
+        )
 
     requested_root = Path(directory).expanduser()
     if requested_root.is_symlink():
@@ -1785,6 +2514,17 @@ def write_packets(
     )
     if passages_root is not None and _paths_overlap(root, passages_root):
         raise SkeletonError(["packet and passage output directories must be disjoint"])
+    requested_report = Path(report_path).expanduser() if report_path is not None else None
+    if requested_report is not None and requested_report.is_symlink():
+        raise SkeletonError([f"refusing symlink report output: {requested_report}"])
+    report_destination = (
+        Path(os.path.abspath(requested_report)) if requested_report is not None else None
+    )
+    if report_destination is not None and (
+        _paths_overlap(root, report_destination)
+        or (passages_root is not None and _paths_overlap(passages_root, report_destination))
+    ):
+        raise SkeletonError(["report output must be disjoint from packet and passage directories"])
     root_identity = _validate_managed_output(root, kind="packets")
     passages_identity = (
         _validate_managed_output(passages_root, kind="passages")
@@ -1793,12 +2533,16 @@ def write_packets(
     )
     packet_stage: Path | None = None
     passages_stage: Path | None = None
+    report_stage: Path | None = None
+    report_identity: tuple[int, int, str] | None = None
     written: list[Path] = []
     manifest: list[dict[str, str]] = []
     passage_manifest: list[dict[str, str]] = []
     try:
         packet_stage = _stage_output(root)
         passages_stage = _stage_output(passages_root) if passages_root is not None else None
+        if report_destination is not None:
+            report_stage, report_identity = _stage_report_output(report, report_destination)
         for node in report.nodes:
             node_path = _safe_node_path(node.node_id)
             passage_path: str | None = None
@@ -1869,15 +2613,21 @@ def write_packets(
         outputs = [(root, packet_stage, root_identity)]
         if passages_root is not None and passages_stage is not None:
             outputs.append((passages_root, passages_stage, passages_identity))
+        if report_destination is not None and report_stage is not None:
+            outputs.append((report_destination, report_stage, report_identity))
         _replace_outputs(outputs)
         packet_stage = None
         passages_stage = None
+        report_stage = None
     except OSError as exc:
         raise SkeletonError([f"could not prepare skeleton output: {exc}"]) from exc
     finally:
-        for stage in (packet_stage, passages_stage):
-            if stage is not None and stage.exists():
-                shutil.rmtree(stage, ignore_errors=True)
+        for stage in (packet_stage, passages_stage, report_stage):
+            if stage is not None:
+                try:
+                    _remove_output(stage)
+                except OSError:
+                    pass
     return written
 
 
@@ -1929,4 +2679,5 @@ __all__ = [
     "source_excerpt",
     "source_passage",
     "write_packets",
+    "write_skeleton_report",
 ]

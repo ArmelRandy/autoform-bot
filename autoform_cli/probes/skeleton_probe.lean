@@ -20,7 +20,7 @@ namespace AutoformSkeleton
 
 /-- The probe-to-Python contract for elaborated declaration material. Bump this
 when the canonical expression encoding below changes. -/
-def semanticSchema := "autoform-lean-expr/v1"
+def semanticSchema := "autoform-lean-expr/v2"
 
 /-- Preserve the structure of a Lean name. `Name.toString` is deliberately not
 used: quoted components may themselves contain dots. -/
@@ -70,34 +70,20 @@ partial def exprJson : Expr → Json
 
 /-- Elaboration result whose exact bytes bind a review to kernel-visible
 meaning. The theorem proof is excluded; definition and opaque bodies are not. -/
-def semanticMaterial (env : Environment) (c : Name) : String :=
-  let payload :=
-    match env.find? c with
-    | some (.defnInfo v) => Json.mkObj [("type", exprJson v.type), ("value", exprJson v.value)]
-    | some (.opaqueInfo v) => Json.mkObj [("type", exprJson v.type), ("value", exprJson v.value)]
-    | some (.inductInfo v) => Json.mkObj [
-        ("type", exprJson v.type),
-        ("constructors", Json.arr <| v.ctors.toArray.map fun ctor =>
-          Json.mkObj [
-            ("name", nameJson ctor),
-            ("type", match env.find? ctor with
-              | some info => exprJson info.type
-              | none => Json.null)])]
-    | some info => Json.mkObj [("type", exprJson info.type)]
-    | none => Json.null
-  payload.compress
-
-/-- Reuse canonical expression serialization across roots in one probe. The
-environment is immutable for the generated `run_cmd`, so `Name` is a complete
-cache key. -/
-def cachedSemanticMaterial
-    (cache : IO.Ref (Std.HashMap Name String))
-    (env : Environment) (c : Name) : CommandElabM String := do
-  if let some material := (← cache.get)[c]? then
-    return material
-  let material := semanticMaterial env c
-  cache.modify (·.insert c material)
-  return material
+def semanticJson (env : Environment) (c : Name) : Json :=
+  match env.find? c with
+  | some (.defnInfo v) => Json.mkObj [("type", exprJson v.type), ("value", exprJson v.value)]
+  | some (.opaqueInfo v) => Json.mkObj [("type", exprJson v.type), ("value", exprJson v.value)]
+  | some (.inductInfo v) => Json.mkObj [
+      ("type", exprJson v.type),
+      ("constructors", Json.arr <| v.ctors.toArray.map fun ctor =>
+        Json.mkObj [
+          ("name", nameJson ctor),
+          ("type", match env.find? ctor with
+            | some info => exprJson info.type
+            | none => Json.null)])]
+  | some info => Json.mkObj [("type", exprJson info.type)]
+  | none => Json.null
 
 /-- Constants that fix the *meaning* of `c`: its type always, and its value only
 when `c` is a definition. A theorem's proof is never part of its meaning. -/
@@ -120,6 +106,41 @@ partial def canonical (env : Environment) (c : Name) : Name :=
     else if isAuxRecursor env c || isNoConfusion env c || Meta.isMatcherCore env c || c.isInternalDetail then
       if c.getPrefix != Name.anonymous && env.contains c.getPrefix then canonical env c.getPrefix else c
     else c
+
+/-- Kernel material for a source declaration and every generated companion
+whose implementation contributes to it. Generated names stay out of the human
+reading list, but their bodies must remain inside the semantic identity. -/
+def semanticMaterial (env : Environment) (c : Name) : String := Id.run do
+  let mut generated : Array Name := #[]
+  let mut work : Array Name := #[c]
+  let mut seen : Array Name := #[]
+  while h : work.size > 0 do
+    let d := work[work.size - 1]
+    work := work.pop
+    if seen.contains d then continue
+    seen := seen.push d
+    for e in meaningConstants env d do
+      if e != c && canonical env e == c && !generated.contains e then
+        generated := generated.push e
+        work := work.push e
+  let entries := generated.qsort Name.lt |>.map fun d => Json.mkObj [
+    ("name", nameJson d),
+    ("material", semanticJson env d)]
+  return (Json.mkObj [
+    ("root", semanticJson env c),
+    ("generated", Json.arr entries)]).compress
+
+/-- Reuse canonical expression serialization across roots in one probe. The
+environment is immutable for the generated `run_cmd`, so `Name` is a complete
+cache key. -/
+def cachedSemanticMaterial
+    (cache : IO.Ref (Std.HashMap Name String))
+    (env : Environment) (c : Name) : CommandElabM String := do
+  if let some material := (← cache.get)[c]? then
+    return material
+  let material := semanticMaterial env c
+  cache.modify (·.insert c material)
+  return material
 
 /-- Direct meaning-dependencies of a folded declaration. Generated companions
 are traversed but folded back onto the source declaration. Results are shared
