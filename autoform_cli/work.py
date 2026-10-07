@@ -161,8 +161,7 @@ def list_ready_work(
         raise WorkError(
             "formalizable leaves need durable article_id metadata: "
             + ", ".join(missing)
-            + " (plan IDs with `autoform migrate article-ids <blueprint> --json`, then"
-            " add each article_id to its article's frontmatter)"
+            + " (add them with `autoform migrate article-ids <blueprint> --write`)"
         )
     unversioned = tuple(node.id for node in unfinished if node.source_sha256 is None)
     if unversioned:
