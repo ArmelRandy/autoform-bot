@@ -299,7 +299,7 @@ def test_probe_spells_names_without_trusting_lean_to_parse_them() -> None:
     )
 
     assert probe.startswith("import Skel.Defs\nimport Skel.Main\n")
-    assert 'Name.str (Name.str (Name.anonymous) "Skel") "observation_determined"' in probe
+    assert _requested(probe) == [["Skel.observation_determined", ["Skel", "observation_determined"]]]
     assert f'"{PROBE_MARKER}' in probe
     assert "def probeOutputLimit : Nat := 67108864" in probe
     assert 'Name.str (Name.anonymous) "Init"' in probe
@@ -310,13 +310,24 @@ def test_probe_spells_names_without_trusting_lean_to_parse_them() -> None:
 def test_probe_transports_quoted_and_numeric_name_components_structurally() -> None:
     probe = render_probe(
         imports=("Skel.Main",),
-        roots=("Skel.«quoted.name with space».2",),
-        project_roots=("Skel",),
+        roots=("Skel.«quoted.name with space».2", "Skel.«2»", "Skel.٢"),
+        project_roots=("Skel.«quoted».2",),
     )
 
-    assert '"Skel.«quoted.name with space».2"' in probe
-    assert 'Name.str (Name.str (Name.anonymous) "Skel") "quoted.name with space"' in probe
-    assert "Name.num (Name.str" in probe
+    assert 'Name.num (Name.str (Name.str (Name.anonymous) "Skel") "quoted") 2' in probe
+    assert _requested(probe) == [
+        ["Skel.«quoted.name with space».2", ["Skel", "quoted.name with space", 2]],
+        ["Skel.«2»", ["Skel", "2"]],
+        ["Skel.٢", ["Skel", "٢"]],
+    ]
+
+
+def _requested(probe: str) -> object:
+    """The JSON roots a rendered probe requests."""
+
+    literal = re.search(r'requestedRoots ("(?:[^"\\]|\\.)*")', probe)
+    assert literal is not None
+    return json.loads(json.loads(literal.group(1)))
 
 
 def test_probe_refuses_to_render_nothing() -> None:
@@ -2835,6 +2846,24 @@ def _probe_records(
 ) -> dict[str, dict[str, object]]:
     probe = render_probe(imports=(module,), roots=roots, project_roots=(project_root or module,))
     return parse_probe_output(run_probe(probe, project))
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_probe_reads_more_roots_than_lean_compiles_in_a_list(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Semantics")
+    # Found roots with a quoted, a needlessly quoted and a numeric component;
+    # absent ones with characters a Lean string literal must escape.
+    found = (
+        "Skel.Semantics.«quoted.helper»",
+        "Skel.Semantics.«usesQuoted»",
+        "_private.Skel.Semantics.0.Skel.Semantics.privateUnsafeValue",
+    )
+    absent = ("Skel.«a\\b\"c»", "Skel.𝔸", *(f"Skel.Semantics.absent{i}" for i in range(3000)))
+
+    records = _probe_records(project, (*found, *absent))
+
+    assert [records[root]["found"] for root in (*found, *absent)] == [True] * 3 + [False] * 3002
 
 
 def _declaration_of(project: Path, record: dict[str, object]):

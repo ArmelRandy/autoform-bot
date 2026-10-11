@@ -582,6 +582,22 @@ def toolchainModules (env : Environment) : IO (Std.HashSet Name) := do
       if libDir.isPrefixOf olean.components then core := core.insert m
   return core
 
+/-- The requested roots, as the CLI passes them: JSON `[request, components]`
+pairs, where a component is a string or a number. A list literal of names
+would be compiled, and the code generator gives up on long ones. -/
+def requestedRoots (text : String) : CommandElabM (Array (String × Name)) := do
+  let decode (entry : Json) : Except String (String × Name) := do
+    let request ← entry.getArrVal? 0 >>= (·.getStr?)
+    let components ← entry.getArrVal? 1 >>= (·.getArr?)
+    let root ← components.foldlM (init := Name.anonymous) fun name component =>
+      match component with
+      | .str part => pure (name.str part)
+      | _ => name.num <$> component.getNat?
+    pure (request, root)
+  match _root_.Lean.Json.parse text >>= (·.getArr?) >>= (·.mapM decode) with
+  | .ok roots => pure roots
+  | .error e => throwError ("the requested roots are malformed: " ++ e)
+
 def skeleton
     (projectRoots : List Name)
     (coreModules : Std.HashSet Name)
@@ -726,7 +742,7 @@ run_cmd do
   let out ← IO.FS.Handle.mk path .write
   let semanticCache : IO.Ref AutoformSkeleton.SemanticCache ← IO.mkRef {{ output := out }}
   try
-    for (request, root) in [{roots}] do
+    for (request, root) in (← AutoformSkeleton.requestedRoots {roots}) do
       AutoformSkeleton.skeleton projectRoots coreModules semanticCache request root
   finally
     out.flush

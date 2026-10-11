@@ -1335,7 +1335,7 @@ def render_probe(
         output_env=PROBE_OUTPUT_ENV,
         output_limit=DEFAULT_PROBE_OUTPUT_LIMIT,
         project_roots=", ".join(_lean_name(name) for name in sorted(set(project_roots))),
-        roots=", ".join(f"({json.dumps(name, ensure_ascii=False)}, {_lean_name(name)})" for name in roots),
+        roots=_lean_requests(roots),
     )
 
 
@@ -1343,12 +1343,32 @@ def _lean_name(name: str) -> str:
     """Spell a Lean name as a term without trusting Lean to parse it."""
 
     result = "Name.anonymous"
-    for part, quoted in _lean_name_parts(name):
-        if not quoted and part.isascii() and part.isdigit():
-            result = f"Name.num ({result}) {int(part)}"
+    for component in _lean_name_components(name):
+        if isinstance(component, int):
+            result = f"Name.num ({result}) {component}"
         else:
-            result = f"Name.str ({result}) {json.dumps(part, ensure_ascii=False)}"
+            result = f"Name.str ({result}) {json.dumps(component, ensure_ascii=False)}"
     return result
+
+
+def _lean_requests(roots: tuple[str, ...]) -> str:
+    """Spell the requested roots as a Lean string of JSON the probe decodes.
+
+    The probe would compile a list literal of names, and Lean's code generator
+    gives up on one longer than about 1,500 entries.
+    """
+
+    payload = [[name, list(_lean_name_components(name))] for name in roots]
+    return json.dumps(json.dumps(payload, ensure_ascii=False), ensure_ascii=False)
+
+
+def _lean_name_components(name: str) -> tuple[str | int, ...]:
+    """The components of a Lean name: unquoted ASCII digits are numeric."""
+
+    return tuple(
+        int(part) if not quoted and part.isascii() and part.isdigit() else part
+        for part, quoted in _lean_name_parts(name)
+    )
 
 
 _LEAN_NAME_PART = r"«([^»]+)»|([^.\s«»]+)"
