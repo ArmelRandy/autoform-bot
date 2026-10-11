@@ -37,7 +37,7 @@ from .skeleton import (
     write_packets,
     write_skeleton_report,
 )
-from .statement_probe import ProbeError, format_probe_report, probe_statements
+from .unused_hypotheses import find_unused_hypotheses, format_unused_hypotheses
 from .work import WORK_SCHEMA, WorkError, assumption_contract, list_ready_work, work_context
 
 
@@ -313,26 +313,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         "the Lake freshness check before it has its own budget",
     )
 
-    probe = subparsers.add_parser(
-        "probe",
+    unused = subparsers.add_parser(
+        "unused-hypotheses",
         help="report the hypotheses that the proof of each theorem the blueprint names never uses",
     )
-    probe.add_argument("blueprint_dir")
-    probe.add_argument(
+    unused.add_argument("blueprint_dir")
+    unused.add_argument(
         "--lean-root",
         type=Path,
         required=True,
         help="built Lean project whose declarations the blueprint names",
     )
-    probe.add_argument(
+    unused.add_argument(
         "--node",
         action="append",
         dest="nodes",
         metavar="ID",
         help="restrict to one article id (repeatable)",
     )
-    probe.add_argument("--json", action="store_true", help="write stable machine-readable output")
-    probe.add_argument(
+    unused.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    unused.add_argument(
         "--timeout",
         type=_positive_seconds,
         metavar="SECONDS",
@@ -375,8 +375,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _migrate(args)
     if args.command == "skeleton":
         return _skeleton(args)
-    if args.command == "probe":
-        return _probe(args)
+    if args.command == "unused-hypotheses":
+        return _unused_hypotheses(args)
     if args.command == "render":
         return _render(args)
     return 2
@@ -1047,19 +1047,19 @@ def _skeleton(args: argparse.Namespace) -> int:
     return 0 if report.clean else 1
 
 
-def _probe(args: argparse.Namespace) -> int:
+def _unused_hypotheses(args: argparse.Namespace) -> int:
     try:
-        report = probe_statements(
+        report = find_unused_hypotheses(
             args.blueprint_dir,
             lean_root=args.lean_root,
             node_ids=tuple(args.nodes) if args.nodes else None,
             timeout=args.timeout or DEFAULT_PROBE_TIMEOUT,
         )
-    except ProbeError as exc:
+    except SkeletonError as exc:
         for issue in exc.issues:
             print(f"error: {issue}", file=sys.stderr)
         return 2
-    print(report.to_json() if args.json else format_probe_report(report), end="\n" if args.json else "")
+    print(report.to_json() if args.json else format_unused_hypotheses(report), end="\n" if args.json else "")
     return 0 if report.clean else 1
 
 

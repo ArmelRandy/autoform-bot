@@ -2039,11 +2039,7 @@ def extract_skeletons(
         graph = load_graph(blueprint_dir)
     except GraphValidationError as exc:
         raise SkeletonError(exc.issues) from exc
-    try:
-        root = Path(lean_root).expanduser().resolve()
-    except RuntimeError as error:
-        # An unknown ~user, or before Python 3.13 a symbolic link loop.
-        raise SkeletonError([f"Lean root {lean_root} cannot be resolved: {error}"]) from error
+    root = resolve_lean_root(lean_root)
     graph_snapshot = _graph_snapshot(graph)
     control_snapshot = _project_control_snapshot(root)
     libraries = lean_libraries(root)
@@ -2093,16 +2089,21 @@ def extract_skeletons(
     return report
 
 
-def extract_graph_skeletons(
-    graph: Graph,
-    *,
-    lean_root: Path,
-    libraries: tuple[LeanLibrary, ...],
-    index: SourceIndex,
-    runner: ProbeRunner,
-    node_ids: tuple[str, ...] | None = None,
-) -> SkeletonReport:
-    """Extract skeletons for an already loaded graph."""
+def resolve_lean_root(lean_root: str | Path) -> Path:
+    """The absolute Lean project root, or a ``SkeletonError`` saying why there is none."""
+
+    try:
+        return Path(lean_root).expanduser().resolve()
+    except RuntimeError as error:
+        # An unknown ~user, or before Python 3.13 a symbolic link loop.
+        raise SkeletonError([f"Lean root {lean_root} cannot be resolved: {error}"]) from error
+
+
+def select_lean_targets(
+    graph: Graph, node_ids: tuple[str, ...] | None = None
+) -> tuple[list[tuple[Node, tuple[str, ...]]], list[tuple[Node, tuple[str, ...]]], str]:
+    """Every article's ``lean:`` targets in id order, the ones ``node_ids`` selects,
+    and ``all`` or ``filtered`` for whether it narrowed them."""
 
     targets: list[tuple[Node, tuple[str, ...]]] = []
     target_issues: list[str] = []
@@ -2122,25 +2123,50 @@ def extract_graph_skeletons(
             targets.append((node, names))
     if target_issues:
         raise SkeletonError(target_issues)
-    target_ids = {node.id for node, _ in targets}
-    selected = targets
-    selection = "all"
-    if node_ids is not None:
-        if not node_ids:
-            raise SkeletonError(["no articles selected"])
-        if len(node_ids) != len(set(node_ids)):
-            raise SkeletonError(["duplicate article selection"])
-        wanted = set(node_ids)
-        unknown = sorted(wanted - set(graph.nodes))
-        if unknown:
-            raise SkeletonError([f"unknown article: {node_id}" for node_id in unknown])
-        untargeted = sorted(wanted - target_ids)
-        if untargeted:
-            raise SkeletonError(
-                [f"{node_id}: article has no Lean declaration targets" for node_id in untargeted]
-            )
-        selected = [(node, names) for node, names in selected if node.id in wanted]
-        selection = "filtered"
+    if node_ids is None:
+        return targets, targets, "all"
+    if not node_ids:
+        raise SkeletonError(["no articles selected"])
+    if len(node_ids) != len(set(node_ids)):
+        raise SkeletonError(["duplicate article selection"])
+    wanted = set(node_ids)
+    unknown = sorted(wanted - set(graph.nodes))
+    if unknown:
+        raise SkeletonError([f"unknown article: {node_id}" for node_id in unknown])
+    untargeted = sorted(wanted - {node.id for node, _ in targets})
+    if untargeted:
+        raise SkeletonError(
+            [f"{node_id}: article has no Lean declaration targets" for node_id in untargeted]
+        )
+    return targets, [(node, names) for node, names in targets if node.id in wanted], "filtered"
+
+
+def locate_declaration(
+    name: str, *, index: SourceIndex, libraries: tuple[LeanLibrary, ...], lean_root: Path
+) -> tuple[str | None, str | None]:
+    """The module that builds ``name``, or ``None`` and the reason no module does."""
+
+    location = index.find(name)
+    if location is None:
+        return None, "declaration not found in the Lean sources"
+    module = module_of(lean_root / location.path, libraries)
+    if module is None:
+        return None, f"source {location.path.as_posix()} is not built by any library target"
+    return module, None
+
+
+def extract_graph_skeletons(
+    graph: Graph,
+    *,
+    lean_root: Path,
+    libraries: tuple[LeanLibrary, ...],
+    index: SourceIndex,
+    runner: ProbeRunner,
+    node_ids: tuple[str, ...] | None = None,
+) -> SkeletonReport:
+    """Extract skeletons for an already loaded graph."""
+
+    targets, selected, selection = select_lean_targets(graph, node_ids)
     passages: dict[str, tuple[str | None, str | None]] = {}
     # An article whose cited passage cannot be found cannot be judged for
     # faithfulness, so its declarations are unresolved rather than shown alone.
@@ -2160,21 +2186,9 @@ def extract_graph_skeletons(
             if node.id in broken_passages:
                 unresolved.append(UnresolvedTarget(node.id, name, broken_passages[node.id]))
                 continue
-            location = index.find(name)
-            module = None if location is None else module_of(lean_root / location.path, libraries)
-            if location is None:
-                unresolved.append(
-                    UnresolvedTarget(node.id, name, "declaration not found in the Lean sources")
-                )
-                continue
+            module, reason = locate_declaration(name, index=index, libraries=libraries, lean_root=lean_root)
             if module is None:
-                unresolved.append(
-                    UnresolvedTarget(
-                        node.id,
-                        name,
-                        f"source {location.path.as_posix()} is not built by any library target",
-                    )
-                )
+                unresolved.append(UnresolvedTarget(node.id, name, reason or ""))
                 continue
             imports.add(module)
             if name not in roots:
@@ -2993,6 +3007,9 @@ __all__ = [
     "SkeletonReport",
     "TrustedDeclaration",
     "extract_graph_skeletons",
+    "locate_declaration",
+    "resolve_lean_root",
+    "select_lean_targets",
     "extract_skeletons",
     "format_report",
     "lean_libraries",

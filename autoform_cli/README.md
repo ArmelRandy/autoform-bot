@@ -595,8 +595,8 @@ briefly observe different generations.
 Report the hypotheses that a theorem's proof never uses:
 
 ```bash
-autoform probe blueprint --lean-root .
-autoform probe blueprint --lean-root . --node chapter/main-result --json
+autoform unused-hypotheses blueprint --lean-root .
+autoform unused-hypotheses blueprint --lean-root . --node chapter/main-result --json
 ```
 
 A theorem can compile and be true while one of its hypotheses plays no part.
@@ -606,21 +606,31 @@ statement assumes the supremum that the source derives from boundedness, or
 when a library convention such as `x / 0 = 0` covers a case the source excludes.
 
 For every theorem a `lean:` line names, the command reads its proof term and
-lists each propositional hypothesis that could be deleted, including one
-written as `p → …` or as an instance argument, with whether the proof uses it.
-A hypothesis the proof never mentions can be deleted, and the same proof proves
-what remains, so a `hypothesis-unused` finding is certain. A hypothesis the
-proof does use may still be unnecessary, and a proof that is just another
-theorem counts as using every hypothesis it passes on. A hypothesis that the
-conclusion or a later binder mentions cannot be deleted and is not listed, and
-a proof resting on `sorry` is not read. Findings are for a reviewer and never
-fail the run, since the source may state a hypothesis its theorem does not
-need; the command exits 1 only when a `lean:` name cannot be found. `--json`
-writes the `autoform-probe/v1` report.
+lists each propositional hypothesis that could be deleted, with its binder
+position and whether the proof uses it. A hypothesis the proof never mentions
+can be deleted, and the same proof proves what remains, so a
+`hypothesis-unused` finding is certain. A hypothesis the proof does use may
+still be unnecessary, and a proof that is just another theorem counts as using
+every hypothesis it passes on. A hypothesis that the conclusion or a later
+binder mentions cannot be deleted and is not listed. A proof that itself
+contains `sorry` is not read; a complete proof that uses an open statement is.
+Findings are for a reviewer and never fail the run, since the source may state
+a hypothesis its theorem does not need; the command exits 1 only when a `lean:`
+name cannot be found. `--json` writes the `autoform-unused-hypotheses/v1`
+report.
+
+`lake build` already warns about some of these: Lean's `unusedVariables`
+linter names a hypothesis the proof never references, and `unusedSectionVars`
+names a section variable a theorem includes without needing. Neither reports a
+hypothesis named with a leading `_`, an unnamed instance argument, the
+antecedent of `p → q`, or a binder such as `∀ n > 0`; this command does, so
+renaming a hypothesis to `_h` does not hide it. It also reports per article,
+for the reviewer of that article.
 
 Like `autoform skeleton`, it runs a small program with `lake env lean` after the
 same Lake freshness check, over the modules that hold the named theorems, and
-the same trust caveats apply. Nothing it reports enters the skeleton report,
+the same trust caveats apply: run it in a trusted checkout or a sandbox whose
+build is current. Nothing it reports enters the skeleton report,
 its packets, or their hashes, and findings name Lean hypotheses, so they stay
 out of the blind read-back route.
 

@@ -138,15 +138,21 @@ superseded declaration that an expand, migrate, contract revision keeps in the
 revised article's `lean:` until it is deleted; report unrelated pre-existing
 findings instead of fixing them.
 
-Once the proof is complete, also run `autoform probe <PROJECT>/blueprint
---lean-root <PROJECT> --node <ID>`. A `hypothesis-unused` finding means the
+Treat Lean's `unusedVariables` and `unusedSectionVars` warnings on the
+article's theorems as findings, and never silence one by renaming the
+hypothesis to `_`. Once the proof is complete, also run `autoform
+unused-hypotheses <PROJECT>/blueprint --lean-root <PROJECT> --node <ID>`, which
+also sees unnamed and `_` hypotheses. A `hypothesis-unused` finding means the
 proof never needs that hypothesis. If the statement assumes something the
 source derives, such as a supremum the source obtains from boundedness, restate
-it to conclude what the source concludes. If the source states the hypothesis
-and Lean does not need it, such as `y n ≠ 0` where `x / 0 = 0`, keep it and
-report it. If the theorem genuinely holds without it, such as a limsup result
+it to conclude what the source concludes. If it is an instance that a section
+`variable` brings in, add `omit [C] in` to the theorem. If the source states
+the hypothesis and Lean does not need it, such as `y n ≠ 0` where `x / 0 = 0`,
+keep it. If the theorem genuinely holds without it, such as a limsup result
 that holds in the extended reals, keep the source's statement for the article
-and prove the general one as a separate lemma that it follows from.
+and prove the general one as a separate lemma that it follows from. For a
+hypothesis you keep, add one sentence to the article saying why, so a later
+reviewer sees the decision beside the finding.
 
 Commit the verified result in its worktree, renew the claim, and rebase onto or
 merge the current shared branch. On the result, run the default `lake build`,
