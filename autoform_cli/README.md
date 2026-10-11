@@ -607,9 +607,10 @@ when a library convention such as `x / 0 = 0` covers a case the source excludes.
 
 For every theorem a `lean:` line names, the command reads its proof term and
 lists each propositional hypothesis that could be deleted, with its binder
-position and whether the proof uses it. A hypothesis the proof never mentions
-can be deleted, and the same proof proves what remains, so a
-`hypothesis-unused` finding is certain. A hypothesis the proof does use may
+position and whether the proof uses it. A hypothesis the proof term never
+mentions can be deleted, and the same term proves what remains, so a
+`hypothesis-unused` finding is certain; a tactic that names the hypothesis,
+such as `simp [h]` or `clear h`, has to drop the name too. A hypothesis the proof does use may
 still be unnecessary, and a proof that is just another theorem counts as using
 every hypothesis it passes on. A hypothesis that the conclusion or a later
 binder mentions cannot be deleted and is not listed. A proof that itself
@@ -622,15 +623,16 @@ report.
 `lake build` already warns about some of these: Lean's `unusedVariables`
 linter names a hypothesis the proof never references, and `unusedSectionVars`
 names a section variable a theorem includes without needing. Neither reports a
-hypothesis named with a leading `_`, an unnamed instance argument, the
-antecedent of `p → q`, or a binder such as `∀ n > 0`; this command does, so
-renaming a hypothesis to `_h` does not hide it. It also reports per article,
+hypothesis named with a leading `_`, an unnamed instance argument of the
+theorem itself, the antecedent of `p → q`, or a binder such as `∀ n > 0`; this
+command does, so renaming a hypothesis to `_h` does not hide it. It also reports per article,
 for the reviewer of that article.
 
 Like `autoform skeleton`, it runs a small program with `lake env lean` after the
 same Lake freshness check, over the modules that hold the named theorems, and
 the same trust caveats apply: run it in a trusted checkout or a sandbox whose
-build is current. Nothing it reports enters the skeleton report,
+build is current. `--timeout SECONDS` sets the Lean run's budget, as for
+`autoform skeleton`. Nothing it reports enters the skeleton report,
 its packets, or their hashes, and findings name Lean hypotheses, so they stay
 out of the blind read-back route.
 

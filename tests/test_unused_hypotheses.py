@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -27,11 +28,11 @@ def _theorem(root: str, *hypotheses: tuple[int, str, str, bool], proof: str = "p
         {"position": position, "name": name, "type": type_, "used": used}
         for position, name, type_, used in hypotheses
     ]
-    return _record(root, found=True, kind="theorem", proof=proof, hypotheses=listed)
+    return _record(root, found=True, proof=proof, hypotheses=listed)
 
 
 def _definition(root: str) -> str:
-    return _record(root, found=True, kind="def", proof="none", hypotheses=[])
+    return _record(root, found=True, proof="none", hypotheses=[])
 
 
 def test_the_probe_lifts_lean_s_command_heartbeat_limit() -> None:
@@ -42,29 +43,53 @@ def test_the_probe_lifts_lean_s_command_heartbeat_limit() -> None:
     assert "set_option maxHeartbeats 0 in\nrun_cmd do" in probe
 
 
+def _entry(**fields: object) -> list[dict[str, object]]:
+    return [{"position": 1, "name": "h", "type": "P", "used": False, **fields}]
+
+
+def test_parse_skips_lean_s_own_output() -> None:
+    output = "\n".join(["info: something Lean printed", _theorem("A.p"), "warning: unused variable"])
+
+    assert set(parse_probe_output(output, expected_roots=("A.p",))) == {"A.p"}
+
+
 @pytest.mark.parametrize(
     ("lines", "message"),
     [
         ([_record("B.q", found=False)], "unrequested declaration"),
         ([_record("A.p", found=False), _record("A.p", found=False)], "twice"),
         ([], "no answer for A.p"),
+        ([PROBE_MARKER + "{not json"], "not JSON"),
+        ([PROBE_MARKER + '{"found": false}'], "without a root name"),
         ([_record("A.p", found="yes")], "non-boolean found"),
-        ([_record("A.p", found=True, kind="lemma", proof="proved", hypotheses=[])], "unknown kind or proof"),
+        ([_record("A.p", found=True, proof="maybe", hypotheses=[])], "unknown proof state"),
         ([_theorem("A.p", (1, "h", "P", False), proof="sorry")], "without reading its proof"),
-        ([_record("A.p", found=True, kind="def", proof="proved", hypotheses=[])], "exactly when it is not a theorem"),
-        ([_record("A.p", found=True, kind="theorem", proof="proved")], "invalid fields"),
-        ([_theorem("A.p", (0, "h", "P", False))], "malformed hypothesis entry"),
+        ([_record("A.p", found=True, proof="proved")], "invalid fields"),
+        ([_record("A.p", found=True, proof="proved", hypotheses={})], "malformed hypotheses"),
+        ([_record("A.p", found=True, proof="proved", hypotheses=_entry(extra=1))], "malformed hypothesis entry"),
+        ([_record("A.p", found=True, proof="proved", hypotheses=_entry(position=0))], "malformed hypothesis entry"),
+        ([_record("A.p", found=True, proof="proved", hypotheses=_entry(position=True))], "malformed hypothesis entry"),
+        ([_record("A.p", found=True, proof="proved", hypotheses=_entry(name=""))], "malformed hypothesis entry"),
+        ([_record("A.p", found=True, proof="proved", hypotheses=_entry(type=""))], "malformed hypothesis entry"),
+        ([_record("A.p", found=True, proof="proved", hypotheses=_entry(used=1))], "malformed hypothesis entry"),
     ],
     ids=[
         "answer-for-another-name",
         "two-answers",
         "no-answer",
+        "not-json",
+        "no-root",
         "non-boolean-found",
-        "unknown-kind",
+        "unknown-proof-state",
         "hypotheses-of-an-unread-proof",
-        "proof-of-a-def",
         "missing-field",
+        "hypotheses-not-a-list",
+        "extra-entry-field",
         "position-zero",
+        "position-boolean",
+        "empty-name",
+        "empty-type",
+        "used-not-boolean",
     ],
 )
 def test_parse_refuses_answers_that_do_not_fit_the_question(lines: list[str], message: str) -> None:
@@ -74,14 +99,22 @@ def test_parse_refuses_answers_that_do_not_fit_the_question(lines: list[str], me
 
 def test_an_unused_hypothesis_is_a_finding_that_does_not_fail(tmp_path: Path) -> None:
     project = _project(tmp_path)
-    lean = {"eligible": "Skel.Eligible", "heavy": "Skel.heavy_of_weight", "pending": "Skel.observation_determined"}
+    lean = {
+        "eligible": "Skel.Eligible",
+        "heavy": "Skel.heavy_of_weight",
+        "one": "Skel.NonAmbiguous",
+        "pending": "Skel.observation_determined",
+        "used": "Skel.heavy",
+    }
     blueprint = _blueprint(tmp_path, lean=lean)
     output = "\n".join(
         [
             _definition("Skel.Eligible"),
             # Lean's printer wraps a long type; the finding keeps it on one line.
             _theorem("Skel.heavy_of_weight", (3, "h", "0 <\n    y", False), (4, "_", "Fact p", False)),
+            _theorem("Skel.NonAmbiguous", (1, "h", "P", False)),
             _theorem("Skel.observation_determined", proof="sorry"),
+            _theorem("Skel.heavy", (1, "h", "P", True)),
         ]
     )
 
@@ -93,27 +126,38 @@ def test_an_unused_hypothesis_is_a_finding_that_does_not_fail(tmp_path: Path) ->
     assert report.findings == (
         "basics/heavy: Skel.heavy_of_weight: hypothesis-unused: the proof never uses h : 0 < y",
         "basics/heavy: Skel.heavy_of_weight: hypothesis-unused: the proof never uses argument 4 : Fact p",
+        "basics/one: Skel.NonAmbiguous: hypothesis-unused: the proof never uses h : P",
     )
     text = format_unused_hypotheses(report)
-    assert "  Skel.heavy_of_weight (theorem): 2 of 2 hypotheses unused\n" in text
-    assert "  Skel.observation_determined (theorem): the proof contains sorry, so it was not read\n" in text
-    assert "  Skel.Eligible (def)\n" in text
+    assert "  Skel.heavy_of_weight: 2 of 2 hypotheses unused\n" in text
+    assert "  Skel.observation_determined: the proof contains sorry, so it was not read\n" in text
+    assert "  Skel.Eligible: not a theorem\n" in text
+    assert "  Skel.NonAmbiguous: 1 of 1 hypothesis unused\n" in text
+    # A theorem whose hypotheses are all used needs no summary.
+    assert "  Skel.heavy\n" in text
     assert "\nerror:" not in text
 
 
 def test_unresolved_declarations_are_reported_and_fail(tmp_path: Path) -> None:
     project = _project(tmp_path)
-    blueprint = _blueprint(tmp_path, lean={"absent": "Skel.absent", "heavy": "Skel.heavy_of_weight, Skel.Eligible"})
+    # `zabsent` is unresolved before Lean runs and `heavy` after, so only sorting
+    # puts them in article order.
+    blueprint = _blueprint(tmp_path, lean={"zabsent": "Skel.absent", "heavy": "Skel.heavy_of_weight, Skel.Eligible"})
     output = "\n".join([_record("Skel.heavy_of_weight", found=False), _definition("Skel.Eligible")])
 
     report = find_unused_hypotheses(blueprint, lean_root=project, runner=lambda probe, root: output)
 
-    assert [item.message for item in report.unresolved] == [
-        "basics/absent: Skel.absent: declaration not found in the Lean sources",
-        "basics/heavy: Skel.heavy_of_weight: declaration not found in the built environment",
+    # The same words as `autoform skeleton`.
+    messages = [
+        "basics/heavy: Skel.heavy_of_weight: not in the built environment after importing Skel.Main; "
+        "check the `lean:` target and declaring source",
+        "basics/zabsent: Skel.absent: declaration not found in the Lean sources",
     ]
+    assert [item.message for item in report.unresolved] == messages
     assert [item.name for item in report.declarations] == ["Skel.Eligible"]
     assert not report.clean
+    text = format_unused_hypotheses(report)
+    assert all(f"error: {message}\n" in text for message in messages)
 
 
 def test_nothing_placed_reports_without_running_lean(tmp_path: Path) -> None:
@@ -145,6 +189,19 @@ def test_the_probe_imports_only_the_modules_it_reads_and_narrows_to_the_selectio
     assert "NonAmbiguous" not in asked[0]
 
 
+def test_a_declaration_two_articles_name_is_read_once(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"a": "Skel.heavy_of_weight", "b": "Skel.heavy_of_weight"})
+
+    def runner(probe: str, root: Path) -> str:
+        assert probe.count('"Skel.heavy_of_weight"') == 1
+        return _theorem("Skel.heavy_of_weight", (3, "h", "0 < y", False))
+
+    report = find_unused_hypotheses(blueprint, lean_root=project, runner=runner)
+
+    assert [item.node_id for item in report.declarations] == ["basics/a", "basics/b"]
+
+
 def test_duplicate_targets_are_refused(tmp_path: Path) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"heavy": "Skel.heavy_of_weight, Skel.heavy_of_weight"})
@@ -153,16 +210,25 @@ def test_duplicate_targets_are_refused(tmp_path: Path) -> None:
         find_unused_hypotheses(blueprint, lean_root=project, runner=lambda probe, root: "")
 
 
-def test_sources_edited_while_lean_runs_are_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("edited", "message"),
+    [
+        ("project/Skel/Main.lean", "Lean sources changed while the unused-hypotheses probe ran"),
+        ("project/lakefile.toml", "Lean project configuration changed while the unused-hypotheses probe ran"),
+        ("blueprint/roadmap/basics/heavy.md", "the blueprint changed while the unused-hypotheses probe ran"),
+    ],
+    ids=["sources", "lake-configuration", "blueprint"],
+)
+def test_inputs_edited_while_lean_runs_are_refused(tmp_path: Path, edited: str, message: str) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"heavy": "Skel.heavy_of_weight"})
 
     def runner(probe: str, root: Path) -> str:
-        with (root / "Skel" / "Main.lean").open("a", encoding="utf-8") as handle:
-            handle.write("-- edited\n")
+        with (tmp_path / edited).open("a", encoding="utf-8") as handle:
+            handle.write("\n")
         return _theorem("Skel.heavy_of_weight")
 
-    with pytest.raises(SkeletonError, match="Lean sources changed"):
+    with pytest.raises(SkeletonError, match=message):
         find_unused_hypotheses(blueprint, lean_root=project, runner=runner)
 
 
@@ -197,6 +263,17 @@ def test_cli_exit_codes_json_and_timeout(
     assert main(command) == 1
     assert timeouts == [30.0, unused_hypotheses.DEFAULT_PROBE_TIMEOUT, unused_hypotheses.DEFAULT_PROBE_TIMEOUT]
     assert main([*command, "--node", "nope"]) == 2
+
+
+def test_cli_names_the_command_when_lake_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"heavy": "Skel.heavy_of_weight"})
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+    assert main(["unused-hypotheses", str(blueprint), "--lean-root", str(project)]) == 2
+    assert "running the unused-hypotheses probe" in capsys.readouterr().err
 
 
 def test_cli_reports_a_lean_root_that_cannot_be_resolved(
@@ -294,3 +371,48 @@ def test_unused_hypotheses_in_a_built_project(tmp_path: Path) -> None:
         "the proof never uses argument 2 : Skel.PosFact n",
         "the proof never uses argument 3 : Skel.PosFact n",
     )
+
+
+def _nested(depth: int) -> str:
+    term = "x"
+    for _ in range(depth):
+        term = f"sqr ({term})"
+    return term
+
+
+_DEEP = f"""\
+import Skel.Main
+
+namespace Skel
+
+def Q (_ : Nat) : Prop := True
+theorem qAll (n : Nat) : Q n := trivial
+def sqr (y : Nat) : Nat := y * y
+def R {{n : Nat}} (_ : Q n) : Prop := True
+theorem rAll {{n : Nat}} (q : Q n) : R q := trivial
+
+-- Shared subterms 40 deep, in the proof and in the statement. Walking either as
+-- a tree instead of a graph takes hours.
+theorem dagProof (x : Nat) (h : x = x) : Q ({_nested(40)}) := by
+  unfold sqr; exact qAll _
+theorem dagStatement (x : Nat) (h : x = x) : R (show Q ({_nested(40)}) by unfold sqr; exact qAll _) := rAll _
+
+end Skel
+"""
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_deeply_shared_terms_are_read_in_time(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "Skel" / "Deep.lean").write_text(_DEEP, encoding="utf-8")
+    with (project / "Skel.lean").open("a", encoding="utf-8") as handle:
+        handle.write("import Skel.Deep\n")
+    _build(project)
+    blueprint = _blueprint(tmp_path, lean={"proof": "Skel.dagProof", "statement": "Skel.dagStatement"})
+
+    report = find_unused_hypotheses(blueprint, lean_root=project, timeout=60)
+
+    assert [finding.split(": ", 2)[2] for finding in report.findings] == [
+        "hypothesis-unused: the proof never uses h : x = x",
+        "hypothesis-unused: the proof never uses h : x = x",
+    ]

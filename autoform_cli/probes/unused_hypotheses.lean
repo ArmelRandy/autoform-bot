@@ -28,16 +28,20 @@ def hypotheses (info : TheoremVal) : MetaM (Option (Array Json)) := do
     -- The proof applied to the binders: its own lambdas are reduced, and a proof
     -- that is a bare constant stays an application that mentions every binder.
     let proof := info.value.beta xs
-    -- One pass over the proof as a graph. Asking per hypothesis whether the term
-    -- mentions it walks shared subterms once per path, which can take hours.
+    -- One pass over the proof, and one over the statement, as graphs. Asking per
+    -- hypothesis whether a term mentions it walks shared subterms once per path,
+    -- which can take hours. A binder's type mentions only earlier binders, so a
+    -- hypothesis in `stated` is one the conclusion or a later binder mentions.
     let used := (collectFVars {{}} proof).fvarSet
+    let mut stated := collectFVars {{}} conclusion
+    for x in xs do
+      stated := collectFVars stated (← inferType x)
     let mut out := #[]
     for i in [0:xs.size] do
       let x := xs[i]!
       let id := x.fvarId!
       unless ← isProp (← inferType x) do continue
-      let mentionedLater ← xs[i+1:].toArray.anyM fun y => return (← inferType y).containsFVar id
-      if conclusion.containsFVar id || mentionedLater then continue
+      if stated.fvarSet.contains id then continue
       let decl ← id.getDecl
       -- A hypothesis written as `p → …` or `[C]` has a hygienic name no reader wrote.
       let name := if decl.userName.hasMacroScopes then "_" else decl.userName.toString
@@ -61,14 +65,6 @@ def emit (fields : List (String × Json)) : CommandElabM Unit := do
     out.flush
   | none => IO.print line
 
-def kindOf : ConstantInfo → String
-  | .thmInfo _ => "theorem"
-  | .axiomInfo _ => "axiom"
-  | .defnInfo _ => "def"
-  | .opaqueInfo _ => "opaque"
-  | .inductInfo _ => "inductive"
-  | _ => "other"
-
 def probe (request : String) (root : Name) : CommandElabM Unit := do
   match (← getEnv).find? root with
   | none => emit [("root", Json.str request), ("found", Json.bool false)]
@@ -79,8 +75,8 @@ def probe (request : String) (root : Name) : CommandElabM Unit := do
         | some found => pure ("proved", found)
         | none => pure ("sorry", #[])
       | _ => pure ("none", #[])
-    emit [("root", Json.str request), ("found", Json.bool true), ("kind", Json.str (kindOf info)),
-      ("proof", Json.str proof), ("hypotheses", Json.arr hypotheses)]
+    emit [("root", Json.str request), ("found", Json.bool true), ("proof", Json.str proof),
+      ("hypotheses", Json.arr hypotheses)]
 
 end AutoformUnusedProbe
 

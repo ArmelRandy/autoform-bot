@@ -34,11 +34,14 @@ from .skeleton import (
     SkeletonError,
     UnresolvedTarget,
     _lean_name,
+    check_configuration_unchanged,
+    check_inputs_unchanged,
     lean_libraries,
     locate_declaration,
     resolve_lean_root,
     run_probe,
     select_lean_targets,
+    snapshot_inputs,
 )
 
 REPORT_SCHEMA = "autoform-unused-hypotheses/v1"
@@ -50,7 +53,6 @@ PROBE_MARKER = "AUTOFORM_UNUSED_HYPOTHESES "
 #: What the probe says about a declaration's proof: read, containing ``sorry``
 #: itself (a term that uses nothing, so it is not read), or not a theorem.
 _PROOFS = frozenset({"proved", "sorry", "none"})
-_KINDS = frozenset({"theorem", "axiom", "def", "opaque", "inductive", "other"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +84,6 @@ class DeclarationHypotheses:
 
     node_id: str
     name: str
-    kind: str
     #: ``proved``, ``sorry`` or ``none`` (not a theorem).
     proof: str
     #: The hypotheses that could be deleted; empty unless ``proof`` is ``proved``.
@@ -98,7 +99,6 @@ class DeclarationHypotheses:
     def as_dict(self) -> dict[str, object]:
         return {
             "hypotheses": [item.as_dict() for item in self.hypotheses],
-            "kind": self.kind,
             "name": self.name,
             "node_id": self.node_id,
             "proof": self.proof,
@@ -163,57 +163,58 @@ def find_unused_hypotheses(
         raise SkeletonError(exc.issues) from exc
     root = resolve_lean_root(lean_root)
     _, selected, _ = select_lean_targets(graph, node_ids)
+    # An answer is about the inputs it was computed from. If they change while
+    # Lean runs, it may describe a state that no longer exists.
+    activity = "the unused-hypotheses probe ran"
+    inputs = snapshot_inputs(graph, root)
     libraries = lean_libraries(root)
+    check_configuration_unchanged(root, inputs, activity=activity)
     try:
         index = index_project(root)
     except OSError as error:
         raise SkeletonError([index_failure_message(error)]) from error
 
     unresolved: list[UnresolvedTarget] = []
-    requests: list[tuple[str, str]] = []
-    imports: set[str] = set()
+    requests: list[tuple[str, str, str]] = []
     for node, names in selected:
         for name in names:
             module, reason = locate_declaration(name, index=index, libraries=libraries, lean_root=root)
             if module is None:
                 unresolved.append(UnresolvedTarget(node.id, name, reason or ""))
                 continue
-            imports.add(module)
-            requests.append((node.id, name))
-    if not requests:
-        return UnusedHypothesesReport(declarations=(), unresolved=tuple(unresolved))
-
-    roots = tuple(dict.fromkeys(name for _, name in requests))
-    execute = runner or (
-        lambda probe, lean_root_: run_probe(probe, lean_root_, timeout=timeout, label="unused-hypotheses probe")
-    )
-    try:
-        output = execute(render_probe(imports=tuple(sorted(imports)), roots=roots), root)
-        current = index_project(root)
-    except OSError as error:
-        raise SkeletonError([index_failure_message(error)]) from error
-    # An answer is about the sources it was computed from. If they changed
-    # while Lean ran, it may describe a state that no longer exists.
-    if current.source_digest != index.source_digest:
-        raise SkeletonError(["Lean sources changed while the probe ran; retry after the build is idle"])
-    records = parse_probe_output(output, expected_roots=roots)
+            requests.append((node.id, name, module))
 
     declarations: list[DeclarationHypotheses] = []
-    for node_id, name in requests:
-        record = records[name]
-        if not record["found"]:
-            unresolved.append(UnresolvedTarget(node_id, name, "declaration not found in the built environment"))
-            continue
-        declarations.append(
-            DeclarationHypotheses(
-                node_id=node_id,
-                name=name,
-                kind=str(record["kind"]),
-                proof=str(record["proof"]),
-                hypotheses=_hypotheses(record["hypotheses"], root=name),
-            )
+    if requests:
+        roots = tuple(dict.fromkeys(name for _, name, _ in requests))
+        imports = tuple(sorted({module for _, _, module in requests}))
+        execute = runner or (
+            lambda probe, lean_root_: run_probe(probe, lean_root_, timeout=timeout, label="unused-hypotheses probe")
         )
-    return UnusedHypothesesReport(declarations=tuple(declarations), unresolved=tuple(unresolved))
+        output = execute(render_probe(imports=imports, roots=roots), root)
+        check_inputs_unchanged(graph, root, index, inputs, activity=activity)
+        records = parse_probe_output(output, expected_roots=roots)
+        for node_id, name, module in requests:
+            record = records[name]
+            if not record["found"]:
+                reason = (
+                    f"not in the built environment after importing {module}; "
+                    "check the `lean:` target and declaring source"
+                )
+                unresolved.append(UnresolvedTarget(node_id, name, reason))
+                continue
+            declarations.append(
+                DeclarationHypotheses(
+                    node_id=node_id,
+                    name=name,
+                    proof=str(record["proof"]),
+                    hypotheses=_hypotheses(record["hypotheses"], root=name),
+                )
+            )
+    return UnusedHypothesesReport(
+        declarations=tuple(declarations),
+        unresolved=tuple(sorted(set(unresolved), key=lambda item: (item.node_id, item.declaration, item.reason))),
+    )
 
 
 def _probe_template() -> str:
@@ -259,16 +260,12 @@ def parse_probe_output(output: str, *, expected_roots: tuple[str, ...]) -> dict[
         found = record.get("found")
         if type(found) is not bool:
             raise SkeletonError([f"the unused-hypotheses probe wrote a non-boolean found field for {root}"])
-        if record.keys() != ({"found", "hypotheses", "kind", "proof", "root"} if found else {"found", "root"}):
+        if record.keys() != ({"found", "hypotheses", "proof", "root"} if found else {"found", "root"}):
             raise SkeletonError([f"the unused-hypotheses probe wrote invalid fields for {root}"])
         if found:
-            kind, proof = record["kind"], record["proof"]
-            if kind not in _KINDS or proof not in _PROOFS:
-                raise SkeletonError([f"the unused-hypotheses probe wrote an unknown kind or proof state for {root}"])
-            if (proof == "none") != (kind != "theorem"):
-                raise SkeletonError(
-                    [f"the unused-hypotheses probe read a proof of {root} exactly when it is not a theorem"]
-                )
+            proof = record["proof"]
+            if proof not in _PROOFS:
+                raise SkeletonError([f"the unused-hypotheses probe wrote an unknown proof state for {root}"])
             if _hypotheses(record["hypotheses"], root=root) and proof != "proved":
                 raise SkeletonError(
                     [f"the unused-hypotheses probe listed hypotheses of {root} without reading its proof"]
@@ -314,14 +311,17 @@ def format_unused_hypotheses(report: UnusedHypothesesReport) -> str:
         if item.node_id != current:
             lines.append(item.node_id)
             current = item.node_id
-        if item.proof == "sorry":
+        unused = sum(not hypothesis.used for hypothesis in item.hypotheses)
+        if item.proof == "none":
+            summary = ": not a theorem"
+        elif item.proof == "sorry":
             summary = ": the proof contains sorry, so it was not read"
-        elif item.hypotheses:
-            unused = sum(not hypothesis.used for hypothesis in item.hypotheses)
-            summary = f": {unused} of {len(item.hypotheses)} hypotheses unused"
+        elif unused:
+            noun = "hypothesis" if len(item.hypotheses) == 1 else "hypotheses"
+            summary = f": {unused} of {len(item.hypotheses)} {noun} unused"
         else:
             summary = ""
-        lines.append(f"  {item.name} ({item.kind}){summary}")
+        lines.append(f"  {item.name}{summary}")
     lines += [f"finding: {finding}" for finding in report.findings]
     lines += [f"error: {item.message}" for item in report.unresolved]
     return "\n".join(lines) + "\n" if lines else "no Lean declarations to read\n"

@@ -336,7 +336,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--timeout",
         type=_positive_seconds,
         metavar="SECONDS",
-        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g})",
+        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g}); "
+        "the Lake freshness check before it has its own budget",
     )
 
     render = subparsers.add_parser("render", help="build the publishable blueprint")

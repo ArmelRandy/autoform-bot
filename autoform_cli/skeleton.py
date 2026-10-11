@@ -2040,13 +2040,10 @@ def extract_skeletons(
     except GraphValidationError as exc:
         raise SkeletonError(exc.issues) from exc
     root = resolve_lean_root(lean_root)
-    graph_snapshot = _graph_snapshot(graph)
-    control_snapshot = _project_control_snapshot(root)
+    activity = "skeletons were being extracted"
+    inputs = snapshot_inputs(graph, root)
     libraries = lean_libraries(root)
-    if _project_control_snapshot(root) != control_snapshot:
-        raise SkeletonError(
-            ["Lean project configuration changed while skeletons were being extracted; retry after the project is idle"]
-        )
+    check_configuration_unchanged(root, inputs, activity=activity)
     try:
         index = index_project(root)
     except OSError as error:
@@ -2059,24 +2056,7 @@ def extract_skeletons(
         runner=runner or run_probe,
         node_ids=node_ids,
     )
-    try:
-        current_index = index_project(root)
-    except OSError as error:
-        raise SkeletonError([index_failure_message(error)]) from error
-    if current_index.source_digest != index.source_digest:
-        raise SkeletonError(["Lean sources changed while skeletons were being extracted; retry after the build is idle"])
-    if _project_control_snapshot(root) != control_snapshot:
-        raise SkeletonError(
-            ["Lean project configuration changed while skeletons were being extracted; retry after the project is idle"]
-        )
-    try:
-        current_graph: Graph | None = load_graph(graph.blueprint_dir)
-    except GraphValidationError:
-        current_graph = None
-    if current_graph is None or _graph_snapshot(current_graph) != graph_snapshot:
-        raise SkeletonError(
-            ["the blueprint changed while skeletons were being extracted; retry after the project is idle"]
-        )
+    current_graph = check_inputs_unchanged(graph, root, index, inputs, activity=activity)
     for node in report.nodes:
         current = current_graph.nodes.get(node.node_id)
         if current is None or source_passage(current, current_graph.blueprint_dir) != (
@@ -2087,6 +2067,54 @@ def extract_skeletons(
                 [f"{node.node_id}: source passage changed while skeletons were being extracted; retry after the project is idle"]
             )
     return report
+
+
+@dataclass(frozen=True, slots=True)
+class InputsSnapshot:
+    """The blueprint and the project configuration, as they were before Lean ran."""
+
+    graph: object
+    configuration: object
+
+
+def snapshot_inputs(graph: Graph, lean_root: Path) -> InputsSnapshot:
+    """Record the inputs a Lean run is about, to refuse its answer if they change."""
+
+    return InputsSnapshot(graph=_graph_snapshot(graph), configuration=_project_control_snapshot(lean_root))
+
+
+def check_configuration_unchanged(lean_root: Path, snapshot: InputsSnapshot, *, activity: str) -> None:
+    """Refuse when the Lake configuration changed since ``snapshot``."""
+
+    if _project_control_snapshot(lean_root) != snapshot.configuration:
+        raise SkeletonError(
+            [f"Lean project configuration changed while {activity}; retry after the project is idle"]
+        )
+
+
+def check_inputs_unchanged(
+    graph: Graph, lean_root: Path, index: SourceIndex, snapshot: InputsSnapshot, *, activity: str
+) -> Graph:
+    """Refuse an answer whose Lean sources, Lake configuration or blueprint changed
+    while Lean ran, and return the blueprint as it is now.
+
+    ``activity`` names what was running, as in "skeletons were being extracted".
+    """
+
+    try:
+        current_index = index_project(lean_root)
+    except OSError as error:
+        raise SkeletonError([index_failure_message(error)]) from error
+    if current_index.source_digest != index.source_digest:
+        raise SkeletonError([f"Lean sources changed while {activity}; retry after the build is idle"])
+    check_configuration_unchanged(lean_root, snapshot, activity=activity)
+    try:
+        current_graph: Graph | None = load_graph(graph.blueprint_dir)
+    except GraphValidationError:
+        current_graph = None
+    if current_graph is None or _graph_snapshot(current_graph) != snapshot.graph:
+        raise SkeletonError([f"the blueprint changed while {activity}; retry after the project is idle"])
+    return current_graph
 
 
 def resolve_lean_root(lean_root: str | Path) -> Path:
@@ -2999,6 +3027,7 @@ __all__ = [
     "SEMANTIC_SCHEMA",
     "SKELETON_SCHEMA",
     "DeclarationSkeleton",
+    "InputsSnapshot",
     "LeanLibrary",
     "NodeSkeleton",
     "PACKET_MANIFEST",
@@ -3006,19 +3035,22 @@ __all__ = [
     "SkeletonError",
     "SkeletonReport",
     "TrustedDeclaration",
+    "check_configuration_unchanged",
+    "check_inputs_unchanged",
     "extract_graph_skeletons",
-    "locate_declaration",
-    "resolve_lean_root",
-    "select_lean_targets",
     "extract_skeletons",
     "format_report",
     "lean_libraries",
     "load_skeleton_report",
+    "locate_declaration",
     "module_of",
     "parse_probe_output",
     "path_of",
     "render_probe",
+    "resolve_lean_root",
     "run_probe",
+    "select_lean_targets",
+    "snapshot_inputs",
     "source_excerpt",
     "source_passage",
     "write_packets",
