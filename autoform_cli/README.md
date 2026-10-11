@@ -732,7 +732,8 @@ strictly read-only. `--write` adds each planned ID as the first frontmatter
 line of the article that lacks one, or as a frontmatter block of its own, and
 changes nothing else. It writes an article only while its bytes still have
 the planned hash, checks every article before writing the first, and refuses
-symlinks; after a refusal, running it again completes the plan. Runtime v3 and
+an article that changed or became a symlink after planning; after such a
+refusal, running it again completes the plan. Runtime v3 and
 `autoform work` expose assigned IDs immediately; preserving publication routes
 across path moves remains a follow-up change.
 

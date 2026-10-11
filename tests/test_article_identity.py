@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -227,3 +228,87 @@ def test_cli_write_reports_each_id_and_leaves_json_to_the_plan(tmp_path: Path, c
     with pytest.raises(SystemExit) as refused:
         main(["migrate", "article-ids", str(blueprint), "--write", "--check"])
     assert refused.value.code == 2
+
+
+def test_write_reads_frontmatter_lines_as_the_loader_does(tmp_path: Path) -> None:
+    blueprint = _blueprint(tmp_path)
+    result = blueprint / "roadmap/chapter/result.md"
+    result.write_bytes(b"---\rnot_ready: true\r---\r\r# Result\r")
+
+    written = {entry.article_path: entry.article_id for entry in write_article_ids(blueprint)}
+
+    article_id = written["roadmap/chapter/result.md"]
+    assert result.read_bytes() == f"---\rarticle_id: {article_id}\rnot_ready: true\r---\r\r# Result\r".encode()
+    assert load_graph(blueprint).nodes["chapter/result"].not_ready
+
+
+def test_cli_lists_written_articles_when_the_blueprint_breaks_meanwhile(tmp_path: Path, monkeypatch, capsys) -> None:
+    blueprint = _blueprint(tmp_path)
+    other = blueprint / "roadmap/chapter/other.md"
+    _article(other, "Other", "af_0123456789abcdef01234567")
+    real_replace = article_identity._replace_if_unchanged
+    calls: list[Path] = []
+
+    def replace_then_break_a_link(path, expected, content, mode):
+        real_replace(path, expected, content, mode)
+        calls.append(path)
+        if len(calls) == 3:
+            broken = other.read_text(encoding="utf-8") + "\n## Depends on\n\n- [x](missing.md)\n"
+            other.write_text(broken, encoding="utf-8")
+
+    monkeypatch.setattr(article_identity, "_replace_if_unchanged", replace_then_break_a_link)
+
+    assert main(["migrate", "article-ids", str(blueprint), "--write"]) == 2
+    captured = capsys.readouterr()
+    assert (captured.out + captured.err).count("added article_id af_") == 3
+    assert "missing.md" in captured.err
+
+
+def test_cli_write_json_keeps_stdout_for_the_plan(tmp_path: Path, capsys) -> None:
+    blueprint = _blueprint(tmp_path)
+
+    assert main(["migrate", "article-ids", str(blueprint), "--write", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["complete"] is True
+    assert captured.err.count("added article_id af_") == 3
+
+
+def test_write_keeps_the_file_mode(tmp_path: Path) -> None:
+    blueprint = _blueprint(tmp_path)
+    result = blueprint / "roadmap/chapter/result.md"
+    result.chmod(0o640)
+
+    write_article_ids(blueprint)
+
+    assert stat.S_IMODE(result.stat().st_mode) == 0o640
+
+
+def test_cli_lists_what_it_wrote_before_a_refusal(tmp_path: Path, monkeypatch, capsys) -> None:
+    blueprint = _blueprint(tmp_path)
+    real_replace = article_identity._replace_if_unchanged
+    calls: list[Path] = []
+
+    def edit_the_second(path, expected, content, mode):
+        calls.append(path)
+        if len(calls) == 2:
+            path.write_text(path.read_text(encoding="utf-8") + "Edited meanwhile.\n", encoding="utf-8")
+        return real_replace(path, expected, content, mode)
+
+    monkeypatch.setattr(article_identity, "_replace_if_unchanged", edit_the_second)
+
+    assert main(["migrate", "article-ids", str(blueprint), "--write"]) == 2
+    err = capsys.readouterr().err
+    assert err.count("added article_id af_") == 1
+    assert "error: added 1 article_id(s) before stopping" in err
+    assert not list(blueprint.rglob("*.tmp"))
+
+
+def test_write_refuses_a_byte_order_mark(tmp_path: Path) -> None:
+    blueprint = _blueprint(tmp_path)
+    (blueprint / "roadmap/chapter/result.md").write_bytes(b"\xef\xbb\xbf---\nnot_ready: true\n---\n\n# Result\n")
+    before = _bytes(blueprint)
+
+    with pytest.raises(article_identity.ArticleIdWriteError, match="byte-order mark"):
+        write_article_ids(blueprint)
+
+    assert _bytes(blueprint) == before

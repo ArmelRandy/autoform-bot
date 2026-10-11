@@ -110,10 +110,10 @@ def write_article_ids(blueprint_dir: str | Path) -> tuple[ArticleIdentityEntry, 
     The ID goes in as the first frontmatter line; an article without
     frontmatter gets a block holding only the ID. Nothing else in the file
     changes. An article is written only while its bytes still have the hash
-    the plan was made from, so an edit made meanwhile is never overwritten:
-    every article is checked before the first is written, and again just
-    before its own replacement. The plan is deterministic, so running the
-    command again after a refusal completes it.
+    the plan was made from, so an article edited meanwhile is refused: every
+    article is checked before the first is written, and again just before its
+    own replacement. The plan is deterministic, so after such a refusal,
+    running the command again completes it.
     """
 
     plan = plan_article_ids(blueprint_dir)
@@ -144,20 +144,9 @@ def write_article_ids(blueprint_dir: str | Path) -> tuple[ArticleIdentityEntry, 
             _replace_if_unchanged(path, entry.source_sha256, content, mode)
         except OSError as error:
             raise ArticleIdWriteError(
-                [f"{entry.article_path}: not written: {error}; run the command again"], tuple(written)
+                [f"{entry.article_path}: not written: {error}"], tuple(written)
             ) from None
         written.append(entry)
-
-    after = {entry.path_id: entry for entry in plan_article_ids(blueprint).entries}
-    wrong = [
-        entry.article_path
-        for entry in written
-        if not after[entry.path_id].assigned or after[entry.path_id].article_id != entry.article_id
-    ]
-    if wrong:
-        raise ArticleIdWriteError(
-            [f"{path}: article_id did not load back as written" for path in wrong], tuple(written)
-        )
     return tuple(written)
 
 
@@ -179,11 +168,14 @@ def _with_article_id(content: bytes, article_id: str) -> bytes:
     """Insert ``article_id`` as the first frontmatter key, keeping the file's line endings."""
 
     text = content.decode("utf-8")
-    first, separator, rest = text.partition("\n")
-    newline = "\r\n" if first.endswith("\r") else "\n"
+    # Split as graph._parse_node does, so both agree on where the frontmatter is.
+    first = text.splitlines(keepends=True)[0] if text else ""
+    opener = first.splitlines()[0] if first else ""
+    ending = first[len(opener) :]
+    newline = ending if ending in ("\r\n", "\r") else "\n"
     line = f"article_id: {article_id}{newline}"
-    if first.strip() == "---" and separator:
-        return (first + separator + line + rest).encode("utf-8")
+    if opener.strip() == "---" and ending:
+        return (first + line + text[len(first) :]).encode("utf-8")
     return (f"---{newline}{line}---{newline}{newline}" + text).encode("utf-8")
 
 
@@ -200,7 +192,7 @@ def _replace_if_unchanged(path: Path, expected_sha256: str, content: bytes, mode
         temporary.chmod(mode)
         current, _ = _read_regular(path)
         if hashlib.sha256(current).hexdigest() != expected_sha256:
-            raise OSError("the article changed while the plan was applied")
+            raise OSError("the article changed while the plan was applied; run the command again")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

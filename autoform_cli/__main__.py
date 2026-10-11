@@ -253,7 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     claim_cleanup = claim_subparsers.add_parser("cleanup")
     _add_claim_board_arguments(claim_cleanup)
 
-    migrate = subparsers.add_parser("migrate", help="inspect authored migration contracts")
+    migrate = subparsers.add_parser("migrate", help="plan or apply authored migrations")
     migrate_subparsers = migrate.add_subparsers(dest="migrate_command", required=True)
     article_ids = migrate_subparsers.add_parser(
         "article-ids",
